@@ -58,10 +58,8 @@ public:
     float GetTowerY(size_t axis) const { return towerY[axis]; }
 
 protected:
-	virtual void Recalc();
-
-private:
 	void Init();
+	virtual void Recalc();
 	void NormaliseEndstopAdjustments();												// Make the average of the endstop adjustments zero
     float Transform(const float headPos[], size_t axis) const;						// Calculate the motor position for a single tower from a Cartesian coordinate
     void ForwardTransform(float Ha, float Hb, float Hc, float headPos[XYZ_AXES]) const;	// Calculate the Cartesian position from the motor positions
