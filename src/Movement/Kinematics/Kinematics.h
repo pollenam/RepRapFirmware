@@ -33,6 +33,7 @@ enum class KinematicsType : uint8_t
 	rotaryDelta,
 	markForged,
 	collinearTriperon,	// reserved for @oliof, see https://forum.duet3d.com/topic/11646/kinematics-type-number-allocation-for-colinear-tripteron
+	invertedLinearDelta,
 
 	unknown				// this one must be last!
 };

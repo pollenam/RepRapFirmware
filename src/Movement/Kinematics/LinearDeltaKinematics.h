@@ -20,9 +20,9 @@ public:
 
 	// Overridden base class functions. See Kinematics.h for descriptions.
 	const char *GetName(bool forStatusReport) const override;
-	bool Configure(unsigned int mCode, GCodeBuffer& gb, const StringRef& reply, bool& error) override;
-	bool CartesianToMotorSteps(const float machinePos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, int32_t motorPos[], bool isCoordinated) const override;
-	void MotorStepsToCartesian(const int32_t motorPos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, float machinePos[]) const override;
+	virtual bool Configure(unsigned int mCode, GCodeBuffer& gb, const StringRef& reply, bool& error) override;
+	virtual bool CartesianToMotorSteps(const float machinePos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, int32_t motorPos[], bool isCoordinated) const override;
+	virtual void MotorStepsToCartesian(const int32_t motorPos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, float machinePos[]) const override;
 	bool SupportsAutoCalibration() const override { return true; }
 	bool DoAutoCalibration(size_t numFactors, const RandomProbePointSet& probePoints, const StringRef& reply) override;
 	void SetCalibrationDefaults() override { Init(); }
@@ -33,7 +33,7 @@ public:
 
 	float GetTiltCorrection(size_t axis) const override;
 	bool IsReachable(float x, float y, bool isCoordinated) const override;
-	LimitPositionResult LimitPosition(float finalCoords[], const float * null initialCoords, size_t numVisibleAxes, AxesBitmap axesHomed, bool isCoordinated, bool applyM208Limits) const override;
+	virtual LimitPositionResult LimitPosition(float finalCoords[], const float * null initialCoords, size_t numVisibleAxes, AxesBitmap axesHomed, bool isCoordinated, bool applyM208Limits) const override;
 	void GetAssumedInitialPosition(size_t numAxes, float positions[]) const override;
 	AxesBitmap AxesToHomeBeforeProbing() const override { return MakeBitmap<AxesBitmap>(X_AXIS) | MakeBitmap<AxesBitmap>(Y_AXIS) | MakeBitmap<AxesBitmap>(Z_AXIS); }
 	MotionType GetMotionType(size_t axis) const override;
@@ -57,9 +57,11 @@ public:
     float GetTowerX(size_t axis) const { return towerX[axis]; }
     float GetTowerY(size_t axis) const { return towerY[axis]; }
 
+protected:
+	virtual void Recalc();
+
 private:
 	void Init();
-	void Recalc();
 	void NormaliseEndstopAdjustments();												// Make the average of the endstop adjustments zero
     float Transform(const float headPos[], size_t axis) const;						// Calculate the motor position for a single tower from a Cartesian coordinate
     void ForwardTransform(float Ha, float Hb, float Hc, float headPos[XYZ_AXES]) const;	// Calculate the Cartesian position from the motor positions

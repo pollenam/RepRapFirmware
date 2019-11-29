@@ -3661,11 +3661,19 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply)
 			Move& move = reprap.GetMove();
 
 			bool changedMode = false;
-			if ((gb.Seen('L') || gb.Seen('D')) && move.GetKinematics().GetKinematicsType() != KinematicsType::linearDelta)
+			if ((gb.Seen('L') || gb.Seen('D')) &&
+					((move.GetKinematics().GetKinematicsType() != KinematicsType::linearDelta) && (move.GetKinematics().GetKinematicsType() != KinematicsType::invertedLinearDelta)))
 			{
 				// Not in delta mode, so switch to it
 				changedMode = true;
-				move.SetKinematics(KinematicsType::linearDelta);
+				if(gb.Seen('I'))
+				{
+					move.SetKinematics(KinematicsType::invertedLinearDelta);
+				}
+				else
+				{
+					move.SetKinematics(KinematicsType::linearDelta);
+				}
 			}
 			bool error = false;
 			const bool changed = move.GetKinematics().Configure(code, gb, reply, error);

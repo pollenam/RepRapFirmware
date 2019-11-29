@@ -13,6 +13,7 @@
 #include "ScaraKinematics.h"
 #include "HangprinterKinematics.h"
 #include "PolarKinematics.h"
+#include "InvertedDeltaKinematics.h"
 
 #include "RepRap.h"
 #include "Platform.h"
@@ -165,6 +166,8 @@ AxesBitmap Kinematics::GetConnectedAxes(size_t axis) const
 		return new PolarKinematics();
 	case KinematicsType::rotaryDelta:
 		return new RotaryDeltaKinematics();
+	case KinematicsType::invertedLinearDelta:
+		return new InvertedDeltaKinematics();
 	}
 }
 
