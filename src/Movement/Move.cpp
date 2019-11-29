@@ -480,7 +480,7 @@ void Move::AxisTransform(float xyzPoint[MaxAxes], const Tool *tool) const
 	const size_t numVisibleAxes = reprap.GetGCodes().GetVisibleAxes();
 	const AxesBitmap xAxes = Tool::GetXAxes(tool);
 	const AxesBitmap yAxes = Tool::GetYAxes(tool);
-	const size_t lowestYAxis = LowestSetBit(yAxes);
+	const size_t lowestYAxis = LowestSetBit((unsigned int)yAxes);
 	if (lowestYAxis < numVisibleAxes)
 	{
 		// Found a Y axis. Use this one when correcting the X coordinate.
@@ -511,7 +511,7 @@ void Move::InverseAxisTransform(float xyzPoint[MaxAxes], const Tool *tool) const
 	const size_t numVisibleAxes = reprap.GetGCodes().GetVisibleAxes();
 	const AxesBitmap xAxes = Tool::GetXAxes(tool);
 	const AxesBitmap yAxes = Tool::GetYAxes(tool);
-	const size_t lowestYAxis = LowestSetBit(yAxes);
+	const size_t lowestYAxis = LowestSetBit((unsigned int)yAxes);
 	if (lowestYAxis < numVisibleAxes)
 	{
 		// Found a Y axis. Use this one when correcting the X coordinate.
