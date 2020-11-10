@@ -13,12 +13,15 @@
 class LaserFilamentMonitor : public Duet3DFilamentMonitor
 {
 public:
-	LaserFilamentMonitor(unsigned int extruder, unsigned int type);
+	LaserFilamentMonitor(unsigned int extruder, unsigned int type) noexcept;
 
 	bool Configure(GCodeBuffer& gb, const StringRef& reply, bool& seen) override;
-	FilamentSensorStatus Check(bool isPrinting, bool fromIsr, uint32_t isrMillis, float filamentConsumed) override;
-	FilamentSensorStatus Clear() override;
-	void Diagnostics(MessageType mtype, unsigned int extruder) override;
+	FilamentSensorStatus Check(bool isPrinting, bool fromIsr, uint32_t isrMillis, float filamentConsumed) noexcept override;
+	FilamentSensorStatus Clear() noexcept override;
+	void Diagnostics(MessageType mtype, unsigned int extruder) noexcept override;
+
+protected:
+	DECLARE_OBJECT_MODEL
 
 private:
 	static constexpr float DefaultMinMovementAllowed = 0.6;
@@ -61,11 +64,14 @@ private:
 
 	static constexpr size_t EdgeCaptureBufferSize = 64;				// must be a power of 2
 
-	void Init();
-	void Reset();
-	void HandleIncomingData();
-	float GetCurrentPosition() const;
-	FilamentSensorStatus CheckFilament(float amountCommanded, float amountMeasured, bool overdue);
+	void Init() noexcept;
+	void Reset() noexcept;
+	void HandleIncomingData() noexcept;
+	float GetCurrentPosition() const noexcept;
+	FilamentSensorStatus CheckFilament(float amountCommanded, float amountMeasured, bool overdue) noexcept;
+
+	bool HaveCalibrationData() const noexcept;
+	float MeasuredSensitivity() const noexcept;
 
 	// Configuration parameters
 	float minMovementAllowed, maxMovementAllowed;

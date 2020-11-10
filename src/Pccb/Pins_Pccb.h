@@ -9,21 +9,24 @@
 #define SRC_PCCB_PINS_PCCB_H_
 
 #if defined(PCCB_10)
-# define FIRMWARE_NAME "RepRapFirmware for PC001373"
-# define DEFAULT_BOARD_TYPE BoardType::PCCB_v10
+# define BOARD_NAME				"PC001373"
+# define BOARD_SHORT_NAME		"PC001373"
+# define FIRMWARE_NAME 			"RepRapFirmware for PC001373"
+# define DEFAULT_BOARD_TYPE 	BoardType::PCCB_v10
 #elif defined(PCCB_08_X5)
-# define FIRMWARE_NAME "RepRapFirmware for PCCB 0.8+DueX5"
-# define DEFAULT_BOARD_TYPE BoardType::PCCB_v08
+# define FIRMWARE_NAME 			"RepRapFirmware for PCCB 0.8+DueX5"
+# define DEFAULT_BOARD_TYPE 	BoardType::PCCB_v08
 #elif defined(PCCB_08)
-# define FIRMWARE_NAME "RepRapFirmware for PCCB 0.8"
-# define DEFAULT_BOARD_TYPE BoardType::PCCB_v08
+# define FIRMWARE_NAME 			"RepRapFirmware for PCCB 0.8"
+# define DEFAULT_BOARD_TYPE 	BoardType::PCCB_v08
 #else
 # error Unknown board
 #endif
 
 constexpr size_t NumFirmwareUpdateModules = 1;		// 1 module
-#define IAP_FIRMWARE_FILE	"PccbFirmware.bin"
-#define IAP_UPDATE_FILE		"iap4s.bin"
+#define IAP_FIRMWARE_FILE		"PccbFirmware.bin"
+#define IAP_UPDATE_FILE			"PccbIAP.bin"
+constexpr uint32_t IAP_IMAGE_START = 0x20010000;
 
 // Features definition
 #define HAS_LWIP_NETWORKING		0
@@ -45,7 +48,6 @@ constexpr size_t NumFirmwareUpdateModules = 1;		// 1 module
 #define HAS_VOLTAGE_MONITOR		1
 #define ENFORCE_MAX_VIN			1
 #define HAS_VREF_MONITOR		1
-#define ACTIVE_LOW_HEAT_ON		0					// although we have no heaters, this matters because we treat the LEDs as heaters
 
 #define SUPPORT_INKJET			0					// set nonzero to support inkjet control
 #define SUPPORT_ROLAND			0					// set nonzero to support Roland mill
@@ -53,11 +55,10 @@ constexpr size_t NumFirmwareUpdateModules = 1;		// 1 module
 #define SUPPORT_IOBITS			0					// set to support P parameter in G0/G1 commands
 #define SUPPORT_DHT_SENSOR		0					// set nonzero to support DHT temperature/humidity sensors (requires RTOS)
 #define SUPPORT_WORKPLACE_COORDINATES	1			// set nonzero to support G10 L2 and G53..59
+#define SUPPORT_OBJECT_MODEL	1
 #define SUPPORT_12864_LCD		0					// set nonzero to support 12864 LCD and rotary encoder
 #define SUPPORT_DOTSTAR_LED		1					// set nonzero to support DotStar LED strips
 #define ALLOCATE_DEFAULT_PORTS	1
-
-#define NO_EXTRUDER_ENDSTOPS	1	// Temporary!!!
 
 // The physical capabilities of the machine
 
@@ -78,11 +79,10 @@ constexpr size_t MaxSmartDrivers = 2;				// The maximum number of smart drivers
 
 #endif
 
-constexpr size_t MaxSensorsInSystem = 32;
-typedef uint32_t SensorsBitmap;
+constexpr size_t MaxSensors = 32;
 
 constexpr size_t MaxHeaters = 1;					// The number of heaters in the machine. PCCB has no heaters.
-constexpr size_t MaxExtraHeaterProtections = 4;		// The number of extra heater protection instances
+constexpr size_t MaxMonitorsPerHeater = 3;			// The maximum number of monitors per heater
 
 constexpr size_t MaxBedHeaters = 1;
 constexpr size_t MaxChamberHeaters = 1;
@@ -92,7 +92,8 @@ constexpr int8_t DefaultE0Heater = 0;				// Index of the default first extruder 
 constexpr size_t NumThermistorInputs = 2;
 constexpr size_t NumTmcDriversSenseChannels = 1;
 
-constexpr size_t MaxGpioPorts = 5;
+constexpr size_t MaxGpInPorts = 5;
+constexpr size_t MaxGpOutPorts = 5;
 
 constexpr size_t MinAxes = 3;						// The minimum and default number of axes
 constexpr size_t MaxAxes = 6;						// The maximum number of movement axes in the machine, <= DRIVES
@@ -107,6 +108,10 @@ constexpr size_t MaxHeatersPerTool = 2;
 constexpr size_t MaxExtrudersPerTool = 1;
 
 constexpr size_t MaxFans = 7;
+
+constexpr unsigned int MaxTriggers = 16;			// Maximum number of triggers
+
+constexpr size_t MaxSpindles = 2;					// Maximum number of configurable spindles
 
 constexpr size_t NUM_SERIAL_CHANNELS = 1;			// The number of serial IO channels (USB only)
 #define SERIAL_MAIN_DEVICE SerialUSB
@@ -144,6 +149,8 @@ constexpr Pin TMC2660MisoPin = PortAPin(12);
 constexpr Pin TMC2660SclkPin = PortAPin(14);
 constexpr Pin GlobalTmc2660EnablePin = PortCPin(16); // The pin that drives ENN of all drivers on the DueX5
 
+constexpr uint32_t DefaultStandstillCurrentPercent = 100;					// it's not adjustable on TMC2660
+
 #elif defined(PCCB_08)
 
 constexpr Pin ENABLE_PINS[NumDirectDrivers] =		{ NoPin,		NoPin,		  PortBPin(14), PortCPin(25), PortCPin( 5), PortCPin(19), PortAPin( 0), PortCPin(28) };
@@ -167,6 +174,8 @@ constexpr uint32_t TransferTimeout = 10;			// any transfer should complete withi
 
 #define UART_TMC_DRV0_Handler	UART0_Handler
 #define UART_TMC_DRV1_Handler	UART1_Handler
+
+constexpr uint32_t DefaultStandstillCurrentPercent = 75;
 
 #endif
 
@@ -217,7 +226,6 @@ constexpr Pin DotStarMosiPin = PortAPin(22);
 constexpr Pin DotStarSclkPin = PortAPin(23);
 constexpr uint32_t DotStarClockId = ID_USART1;
 constexpr IRQn DotStarIRQn = USART1_IRQn;
-const uint32_t DotStarSpiClockFrequency = 100000;		// try sending at 100kHz
 
 // SD cards
 constexpr size_t NumSdCards = 1;
@@ -245,7 +253,7 @@ enum class PinCapability: uint8_t
 	ainrwpwm = 1|2|4|8
 };
 
-constexpr inline PinCapability operator|(PinCapability a, PinCapability b)
+constexpr inline PinCapability operator|(PinCapability a, PinCapability b) noexcept
 {
 	return (PinCapability)((uint8_t)a | (uint8_t)b);
 }
@@ -254,9 +262,9 @@ constexpr inline PinCapability operator|(PinCapability a, PinCapability b)
 // This can be varied to suit the hardware. It is a struct not a class so that it can be direct initialised in read-only memory.
 struct PinEntry
 {
-	Pin GetPin() const { return pin; }
-	PinCapability GetCapability() const { return cap; }
-	const char* GetNames() const { return names; }
+	Pin GetPin() const noexcept { return pin; }
+	PinCapability GetCapability() const noexcept { return cap; }
+	const char* GetNames() const noexcept { return names; }
 
 	Pin pin;
 	PinCapability cap;
@@ -324,7 +332,9 @@ constexpr PinEntry PinTable[] =
 constexpr unsigned int NumNamedPins = ARRAY_SIZE(PinTable);
 
 // Function to look up a pin name pass back the corresponding index into the pin table
-bool LookupPinName(const char *pn, LogicalPin& lpin, bool& hardwareInverted);
+bool LookupPinName(const char *pn, LogicalPin& lpin, bool& hardwareInverted) noexcept;
+
+#if ALLOCATE_DEFAULT_PORTS
 
 // Default pin allocations
 constexpr const char *DefaultEndstopPinNames[] = { "stop1", "nil", "stop0" };	// stop0 is the default Z endstop, stop1 is the X endstop
@@ -340,9 +350,7 @@ constexpr const char *DefaultFanPinNames[] = { "fan0", "fan1", "fan2", "!fan3+fa
 constexpr PwmFrequency DefaultFanPwmFrequencies[] = { DefaultFanPwmFreq, DefaultFanPwmFreq, DefaultFanPwmFreq, 25000 };
 #endif
 
-// SAM4S Flash locations (may be expanded in the future)
-constexpr uint32_t IAP_FLASH_START = 0x00470000;
-constexpr uint32_t IAP_FLASH_END = 0x0047FFFF;								// we allow a full 64K on the SAM4
+#endif
 
 // Timer allocation
 // TC0 channel 0 is used for step pulse generation and software timers (lower 16 bits)
@@ -364,7 +372,7 @@ namespace StepPins
 	// All our step pins are on port C, so the bitmap is just the map of step bits in port C.
 
 	// Calculate the step bit for a driver. This doesn't need to be fast. It must return 0 if the driver is remote.
-	static inline uint32_t CalcDriverBitmap(size_t driver)
+	static inline uint32_t CalcDriverBitmap(size_t driver) noexcept
 	{
 		return (driver < NumDirectDrivers)
 				? g_APinDescription[STEP_PINS[driver]].ulPin
@@ -374,7 +382,7 @@ namespace StepPins
 	// Set the specified step pins high
 	// This needs to be as fast as possible, so we do a parallel write to the port(s).
 	// We rely on only those port bits that are step pins being set in the PIO_OWSR register of each port
-	static inline void StepDriversHigh(uint32_t driverMap)
+	static inline void StepDriversHigh(uint32_t driverMap) noexcept
 	{
 		PIOC->PIO_ODSR = driverMap;				// on PCCB all step pins are on port C
 	}
@@ -382,7 +390,7 @@ namespace StepPins
 	// Set all step pins low
 	// This needs to be as fast as possible, so we do a parallel write to the port(s).
 	// We rely on only those port bits that are step pins being set in the PIO_OWSR register of each port
-	static inline void StepDriversLow()
+	static inline void StepDriversLow() noexcept
 	{
 		PIOC->PIO_ODSR = 0;						// on PCCB all step pins are on port C
 	}

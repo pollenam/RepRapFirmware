@@ -20,7 +20,7 @@
 // The parameters that can be configured in RRF are R25 (the resistance at 25C), Beta, and optionally C.
 
 // Create an instance with default values
-Thermistor::Thermistor(unsigned int sensorNum, bool p_isPT1000)
+Thermistor::Thermistor(unsigned int sensorNum, bool p_isPT1000) noexcept
 	: SensorWithPort(sensorNum, (p_isPT1000) ? "PT1000" : "Thermistor"),
 	  r25(DefaultR25), beta(DefaultBeta), shC(DefaultShc), seriesR(DefaultThermistorSeriesR), adcFilterChannel(-1), isPT1000(p_isPT1000)
 #if !HAS_VREF_MONITOR || defined(DUET3)
@@ -31,15 +31,14 @@ Thermistor::Thermistor(unsigned int sensorNum, bool p_isPT1000)
 }
 
 // Configure the temperature sensor
-GCodeResult Thermistor::Configure(GCodeBuffer& gb, const StringRef& reply)
+GCodeResult Thermistor::Configure(GCodeBuffer& gb, const StringRef& reply, bool& changed)
 {
-	bool seen = false;
-	if (!ConfigurePort(gb, reply, PinAccess::readAnalog, seen))
+	if (!ConfigurePort(gb, reply, PinAccess::readAnalog, changed))
 	{
 		return GCodeResult::error;
 	}
 
-	gb.TryGetFValue('R', seriesR, seen);
+	gb.TryGetFValue('R', seriesR, changed);
 	if (!isPT1000)
 	{
 		bool seenB = false;
@@ -47,33 +46,32 @@ GCodeResult Thermistor::Configure(GCodeBuffer& gb, const StringRef& reply)
 		if (seenB)
 		{
 			shC = 0.0;						// if user changes B and doesn't define C, assume C=0
-			seen = true;
+			changed = true;
 		}
-		gb.TryGetFValue('C', shC, seen);
-		gb.TryGetFValue('T', r25, seen);
-		if (seen)
+		gb.TryGetFValue('C', shC, changed);
+		gb.TryGetFValue('T', r25, changed);
+		if (changed)
 		{
 			CalcDerivedParameters();
 		}
 	}
 
 #if !HAS_VREF_MONITOR || defined(DUET3)
-	constexpr int maxOffset = (int)(30u << (AdcBits + AdcOversampleBits - 12));
 	if (gb.Seen('L'))
 	{
-		adcLowOffset = (int16_t)constrain<int>(gb.GetIValue(), -maxOffset, maxOffset);
-		seen = true;
+		adcLowOffset = (int8_t)constrain<int>(gb.GetIValue(), std::numeric_limits<int8_t>::min(), std::numeric_limits<int8_t>::max());
+		changed = true;
 	}
 	if (gb.Seen('H'))
 	{
-		adcHighOffset = (int16_t)constrain<int>(gb.GetIValue(), -maxOffset, maxOffset);
-		seen = true;
+		adcHighOffset = (int8_t)constrain<int>(gb.GetIValue(), std::numeric_limits<int8_t>::min(), std::numeric_limits<int8_t>::max());
+		changed = true;
 	}
 #endif
 
-	TryConfigureSensorName(gb, seen);
+	TryConfigureSensorName(gb, changed);
 
-	if (seen)
+	if (changed)
 	{
 		adcFilterChannel = reprap.GetPlatform().GetAveragingFilterIndex(port);
 		if (adcFilterChannel >= 0)
@@ -102,7 +100,7 @@ GCodeResult Thermistor::Configure(GCodeBuffer& gb, const StringRef& reply)
 }
 
 // Get the temperature
-void Thermistor::Poll()
+void Thermistor::Poll() noexcept
 {
 	int32_t averagedTempReading;
 	bool tempFilterValid;
@@ -127,10 +125,14 @@ void Thermistor::Poll()
 # ifdef DUET3
 		// Duet 3 MB6HC board revisions 0.6 and 1.0 have the series resistor connected to VrefP, not VrefMon.
 		// So Extrapolate the reading for VrefP. We also allow offsets to be added.
+		// Version 1.01 and later boards have the series resistors connected to VrefMon.
 		const int32_t rawAveragedVssaReading = vssaFilter.GetSum()/(vssaFilter.NumAveraged() >> Thermistor::AdcOversampleBits);
 		const int32_t rawAveragedVrefReading = vrefFilter.GetSum()/(vrefFilter.NumAveraged() >> Thermistor::AdcOversampleBits);
-		const int32_t averagedVssaReading = rawAveragedVssaReading + adcLowOffset;
-		const int32_t averagedVrefReading = ((rawAveragedVrefReading - rawAveragedVssaReading) * (4715.0/4700.0)) + rawAveragedVssaReading + adcHighOffset;
+		const int32_t averagedVssaReading = rawAveragedVssaReading + (adcLowOffset * (1 << (AdcBits - 12 + Thermistor::AdcOversampleBits - 1)));
+		const int32_t averagedVrefReading = ((reprap.GetPlatform().GetBoardType() == BoardType::Duet3_v06_100)
+											? ((rawAveragedVrefReading - rawAveragedVssaReading) * (4715.0/4700.0)) + rawAveragedVssaReading
+												: rawAveragedVrefReading
+											) + (adcHighOffset * (1 << (AdcBits - 12 + Thermistor::AdcOversampleBits - 1)));
 # else
 		const int32_t averagedVssaReading = vssaFilter.GetSum()/(vssaFilter.NumAveraged() >> Thermistor::AdcOversampleBits);
 		const int32_t averagedVrefReading = vrefFilter.GetSum()/(vrefFilter.NumAveraged() >> Thermistor::AdcOversampleBits);
@@ -222,7 +224,7 @@ void Thermistor::Poll()
 }
 
 // Calculate shA and shB from the other parameters
-void Thermistor::CalcDerivedParameters()
+void Thermistor::CalcDerivedParameters() noexcept
 {
 	shB = 1.0/beta;
 	const float lnR25 = logf(r25);

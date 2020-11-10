@@ -11,12 +11,21 @@
 
 #if HAS_SMART_DRIVERS
 
-TmcDriverTemperatureSensor::TmcDriverTemperatureSensor(unsigned int sensorNum, unsigned int chan)
-	: TemperatureSensor(sensorNum, "TMC2660 temperature warnings"), channel(chan)
+TmcDriverTemperatureSensor::TmcDriverTemperatureSensor(unsigned int sensorNum, unsigned int chan) noexcept
+	: TemperatureSensor(sensorNum, "Stepper driver temperature warnings"), channel(chan)
 {
 }
 
-void TmcDriverTemperatureSensor::Poll()
+const char *TmcDriverTemperatureSensor::GetShortSensorType() const noexcept
+{
+#ifdef DUET_NG
+	return (channel == 1) ? DuexTypeShortName : PrimaryTypeName;
+#else
+	return PrimaryTypeName;
+#endif
+}
+
+void TmcDriverTemperatureSensor::Poll() noexcept
 {
 	SetResult(reprap.GetPlatform().GetTmcDriversTemperature(channel), TemperatureError::success);
 }

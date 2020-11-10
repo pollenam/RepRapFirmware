@@ -16,7 +16,45 @@
 // is more likely to cause errors. This constant sets the delay required after a retract or reprime move before we accept the measurement.
 const int32_t SyncDelayMillis = 10;
 
-PulsedFilamentMonitor::PulsedFilamentMonitor(unsigned int extruder, unsigned int type)
+#if SUPPORT_OBJECT_MODEL
+
+// Object model table and functions
+// Note: if using GCC version 7.3.1 20180622 and lambda functions are used in this table, you must compile this file with option -std=gnu++17.
+// Otherwise the table will be allocated in RAM instead of flash, which wastes too much RAM.
+
+// Macro to build a standard lambda function that includes the necessary type conversions
+#define OBJECT_MODEL_FUNC(...) OBJECT_MODEL_FUNC_BODY(PulsedFilamentMonitor, __VA_ARGS__)
+#define OBJECT_MODEL_FUNC_IF(...) OBJECT_MODEL_FUNC_IF_BODY(PulsedFilamentMonitor, __VA_ARGS__)
+
+constexpr ObjectModelTableEntry PulsedFilamentMonitor::objectModelTable[] =
+{
+	// Within each group, these entries must be in alphabetical order
+	// 0. PulsedFilamentMonitor members
+	{ "calibrated", 	OBJECT_MODEL_FUNC_IF(self->DataReceived() && self->HaveCalibrationData(), self, 1), 	ObjectModelEntryFlags::none },
+	{ "configured", 	OBJECT_MODEL_FUNC(self, 2), 															ObjectModelEntryFlags::none },
+	{ "enabled",		OBJECT_MODEL_FUNC(self->comparisonEnabled),		 										ObjectModelEntryFlags::none },
+	{ "type",			OBJECT_MODEL_FUNC_NOSELF("pulsed"), 													ObjectModelEntryFlags::none },
+
+	// 1. PulsedFilamentMonitor.calibrated members
+	{ "mmPerPulse",		OBJECT_MODEL_FUNC(self->MeasuredSensitivity(), 3), 										ObjectModelEntryFlags::none },
+	{ "percentMax",		OBJECT_MODEL_FUNC(ConvertToPercent(self->maxMovementRatio)), 							ObjectModelEntryFlags::none },
+	{ "percentMin",		OBJECT_MODEL_FUNC(ConvertToPercent(self->minMovementRatio)), 							ObjectModelEntryFlags::none },
+	{ "totalDistance",	OBJECT_MODEL_FUNC(self->totalExtrusionCommanded, 1), 									ObjectModelEntryFlags::none },
+
+	// 2. PulsedFilamentMonitor.configured members
+	{ "mmPerPulse",		OBJECT_MODEL_FUNC(self->mmPerPulse, 3), 												ObjectModelEntryFlags::none },
+	{ "percentMax",		OBJECT_MODEL_FUNC(ConvertToPercent(self->maxMovementAllowed)), 							ObjectModelEntryFlags::none },
+	{ "percentMin",		OBJECT_MODEL_FUNC(ConvertToPercent(self->minMovementAllowed)), 							ObjectModelEntryFlags::none },
+	{ "sampleDistance", OBJECT_MODEL_FUNC(self->minimumExtrusionCheckLength, 1), 								ObjectModelEntryFlags::none },
+};
+
+constexpr uint8_t PulsedFilamentMonitor::objectModelTableDescriptor[] = { 3, 4, 4, 4 };
+
+DEFINE_GET_OBJECT_MODEL_TABLE(PulsedFilamentMonitor)
+
+#endif
+
+PulsedFilamentMonitor::PulsedFilamentMonitor(unsigned int extruder, unsigned int type) noexcept
 	: FilamentMonitor(extruder, type),
 	  mmPerPulse(DefaultMmPerPulse),
 	  minMovementAllowed(DefaultMinMovementAllowed), maxMovementAllowed(DefaultMaxMovementAllowed),
@@ -25,7 +63,7 @@ PulsedFilamentMonitor::PulsedFilamentMonitor(unsigned int extruder, unsigned int
 	Init();
 }
 
-void PulsedFilamentMonitor::Init()
+void PulsedFilamentMonitor::Init() noexcept
 {
 	sensorValue = 0;
 	calibrationStarted = false;
@@ -34,12 +72,27 @@ void PulsedFilamentMonitor::Init()
 	Reset();
 }
 
-void PulsedFilamentMonitor::Reset()
+void PulsedFilamentMonitor::Reset() noexcept
 {
 	extrusionCommandedThisSegment = extrusionCommandedSinceLastSync = movementMeasuredThisSegment = movementMeasuredSinceLastSync = 0.0;
 	comparisonStarted = false;
 	haveInterruptData = false;
 	wasPrintingAtInterrupt = false;			// force a resync
+}
+
+bool PulsedFilamentMonitor::DataReceived() const noexcept
+{
+	return samplesReceived >= 2;
+}
+
+bool PulsedFilamentMonitor::HaveCalibrationData() const noexcept
+{
+	return calibrationStarted && fabsf(totalMovementMeasured) > 1.0 && totalExtrusionCommanded > 20.0;
+}
+
+float PulsedFilamentMonitor::MeasuredSensitivity() const noexcept
+{
+	return totalExtrusionCommanded/totalMovementMeasured;
 }
 
 // Configure this sensor, returning true if error and setting 'seen' if we processed any configuration parameters
@@ -78,6 +131,7 @@ bool PulsedFilamentMonitor::Configure(GCodeBuffer& gb, const StringRef& reply, b
 	if (seen)
 	{
 		Init();
+		reprap.SensorsUpdated();
 	}
 	else
 	{
@@ -86,29 +140,25 @@ bool PulsedFilamentMonitor::Configure(GCodeBuffer& gb, const StringRef& reply, b
 		reply.catf(", %s, sensitivity %.3fmm/pulse, allowed movement %ld%% to %ld%%, check every %.1fmm, ",
 					(comparisonEnabled) ? "enabled" : "disabled",
 					(double)mmPerPulse,
-					lrintf(minMovementAllowed * 100.0),
-					lrintf(maxMovementAllowed * 100.0),
+					ConvertToPercent(minMovementAllowed),
+					ConvertToPercent(maxMovementAllowed),
 					(double)minimumExtrusionCheckLength);
 
-		if (samplesReceived < 2)
+		if (!DataReceived())
 		{
 			reply.cat("no data received");
 		}
+		else if (HaveCalibrationData())
+		{
+			reply.catf("measured sensitivity %.3fmm/pulse, measured minimum %ld%%, maximum %ld%% over %.1fmm\n",
+				(double)MeasuredSensitivity(),
+				ConvertToPercent(minMovementRatio),
+				ConvertToPercent(maxMovementRatio),
+				(double)totalExtrusionCommanded);
+		}
 		else
 		{
-			if (calibrationStarted && fabsf(totalMovementMeasured) > 1.0 && totalExtrusionCommanded > 20.0)
-			{
-				const float measuredMmPerPulse = totalExtrusionCommanded/totalMovementMeasured;
-				reply.catf("measured sensitivity %.3fmm/pulse, measured minimum %ld%%, maximum %ld%% over %.1fmm\n",
-					(double)measuredMmPerPulse,
-					lrintf(100 * minMovementRatio),
-					lrintf(100 * maxMovementRatio),
-					(double)totalExtrusionCommanded);
-			}
-			else
-			{
-				reply.cat("no calibration data");
-			}
+			reply.cat("no calibration data");
 		}
 	}
 
@@ -116,7 +166,7 @@ bool PulsedFilamentMonitor::Configure(GCodeBuffer& gb, const StringRef& reply, b
 }
 
 // ISR for when the pin state changes. It should return true if the ISR wants the commanded extrusion to be fetched.
-bool PulsedFilamentMonitor::Interrupt()
+bool PulsedFilamentMonitor::Interrupt() noexcept
 {
 	++sensorValue;
 	if (samplesReceived < 100)
@@ -136,7 +186,7 @@ bool PulsedFilamentMonitor::Interrupt()
 }
 
 // Call the following regularly to keep the status up to date
-void PulsedFilamentMonitor::Poll()
+void PulsedFilamentMonitor::Poll() noexcept
 {
 	cpu_irq_disable();
 	const uint32_t locSensorVal = sensorValue;
@@ -164,7 +214,7 @@ void PulsedFilamentMonitor::Poll()
 // 'filamentConsumed' is the net amount of extrusion since the last call to this function.
 // 'isPrinting' is true unless a non-printing extruder move was in progress
 // 'fromIsr' is true if this measurement was taken at the end of the ISR because the ISR returned true
-FilamentSensorStatus PulsedFilamentMonitor::Check(bool isPrinting, bool fromIsr, uint32_t isrMillis, float filamentConsumed)
+FilamentSensorStatus PulsedFilamentMonitor::Check(bool isPrinting, bool fromIsr, uint32_t isrMillis, float filamentConsumed) noexcept
 {
 	// 1. Update the extrusion commanded
 	extrusionCommandedSinceLastSync += filamentConsumed;
@@ -199,7 +249,7 @@ FilamentSensorStatus PulsedFilamentMonitor::Check(bool isPrinting, bool fromIsr,
 }
 
 // Compare the amount commanded with the amount of extrusion measured, and set up for the next comparison
-FilamentSensorStatus PulsedFilamentMonitor::CheckFilament(float amountCommanded, float amountMeasured, bool overdue)
+FilamentSensorStatus PulsedFilamentMonitor::CheckFilament(float amountCommanded, float amountMeasured, bool overdue) noexcept
 {
 	if (reprap.Debug(moduleFilamentSensors))
 	{
@@ -263,7 +313,7 @@ FilamentSensorStatus PulsedFilamentMonitor::CheckFilament(float amountCommanded,
 }
 
 // Clear the measurement state - called when we are not printing a file. Return the present/not present status if available.
-FilamentSensorStatus PulsedFilamentMonitor::Clear()
+FilamentSensorStatus PulsedFilamentMonitor::Clear() noexcept
 {
 	Poll();								// to keep the diagnostics up to date
 	Reset();
@@ -271,7 +321,7 @@ FilamentSensorStatus PulsedFilamentMonitor::Clear()
 }
 
 // Print diagnostic info for this sensor
-void PulsedFilamentMonitor::Diagnostics(MessageType mtype, unsigned int extruder)
+void PulsedFilamentMonitor::Diagnostics(MessageType mtype, unsigned int extruder) noexcept
 {
 	Poll();
 	const char* const statusText = (samplesReceived < 2) ? "no data received" : "ok";

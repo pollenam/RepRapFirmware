@@ -35,24 +35,23 @@ const uint8_t Cr0ReadMask = 0b11011101;		// bits 1 and 5 auto clear, so ignore t
 
 const uint16_t DefaultRef = 400;
 
-RtdSensor31865::RtdSensor31865(unsigned int sensorNum)
+RtdSensor31865::RtdSensor31865(unsigned int sensorNum) noexcept
 	: SpiTemperatureSensor(sensorNum, "PT100 (MAX31865)", MAX31865_SpiMode, MAX31865_Frequency),
 	  rref(DefaultRef), cr0(DefaultCr0)
 {
 }
 
 // Configure this temperature sensor
-GCodeResult RtdSensor31865::Configure(GCodeBuffer& gb, const StringRef& reply)
+GCodeResult RtdSensor31865::Configure(GCodeBuffer& gb, const StringRef& reply, bool& changed)
 {
-	bool seen = false;
-	if (!ConfigurePort(gb, reply, seen))
+	if (!ConfigurePort(gb, reply, changed))
 	{
 		return GCodeResult::error;
 	}
-	TryConfigureSensorName(gb, seen);
+	TryConfigureSensorName(gb, changed);
 	if (gb.Seen('F'))
 	{
-		seen = true;
+		changed = true;
 		if (gb.GetIValue() == 60)
 		{
 			cr0 &= ~0x01;		// set 60Hz rejection
@@ -65,7 +64,7 @@ GCodeResult RtdSensor31865::Configure(GCodeBuffer& gb, const StringRef& reply)
 
 	if (gb.Seen('W'))
 	{
-		seen = true;
+		changed = true;
 		if (gb.GetUIValue() == 3)
 		{
 			cr0 |= 0x10;		// 3 wire configuration
@@ -78,11 +77,11 @@ GCodeResult RtdSensor31865::Configure(GCodeBuffer& gb, const StringRef& reply)
 
 	if (gb.Seen('R'))
 	{
-		seen = true;
+		changed = true;
 		rref = (uint16_t)gb.GetUIValue();
 	}
 
-	if (seen)
+	if (changed)
 	{
 		// Initialise the sensor
 		InitSpi();
@@ -117,7 +116,7 @@ GCodeResult RtdSensor31865::Configure(GCodeBuffer& gb, const StringRef& reply)
 }
 
 // Try to initialise the RTD
-TemperatureError RtdSensor31865::TryInitRtd() const
+TemperatureError RtdSensor31865::TryInitRtd() const noexcept
 {
 	const uint8_t modeData[2] = { 0x80, cr0 };			// write register 0
 	uint32_t rawVal;
@@ -139,7 +138,7 @@ TemperatureError RtdSensor31865::TryInitRtd() const
 	return sts;
 }
 
-void RtdSensor31865::Poll()
+void RtdSensor31865::Poll() noexcept
 {
 	static const uint8_t dataOut[4] = {0, 0x55, 0x55, 0x55};			// read registers 0 (control), 1 (MSB) and 2 (LSB)
 	uint32_t rawVal;

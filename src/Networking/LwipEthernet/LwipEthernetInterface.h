@@ -28,65 +28,53 @@ struct tcp_pcb;
 class LwipEthernetInterface : public NetworkInterface
 {
 public:
-	LwipEthernetInterface(Platform& p);
+	LwipEthernetInterface(Platform& p) noexcept;
 
-	void Init() override;
-	void Activate() override;
-	void Exit() override;
-	void Spin(bool full) override;
-	void Interrupt() override;
-	void Diagnostics(MessageType mtype) override;
+	void Init() noexcept override;
+	void Activate() noexcept override;
+	void Exit() noexcept override;
+	void Spin() noexcept override;
+	void Diagnostics(MessageType mtype) noexcept override;
 
-	GCodeResult EnableInterface(int mode, const StringRef& ssid, const StringRef& reply) override;			// enable or disable the network
-	GCodeResult EnableProtocol(NetworkProtocol protocol, int port, int secure, const StringRef& reply) override;
-	GCodeResult DisableProtocol(NetworkProtocol protocol, const StringRef& reply) override;
-	GCodeResult ReportProtocols(const StringRef& reply) const override;
+	GCodeResult EnableInterface(int mode, const StringRef& ssid, const StringRef& reply) noexcept override;			// enable or disable the network
+	GCodeResult EnableProtocol(NetworkProtocol protocol, int port, int secure, const StringRef& reply) noexcept override;
+	GCodeResult DisableProtocol(NetworkProtocol protocol, const StringRef& reply) noexcept override;
+	GCodeResult ReportProtocols(const StringRef& reply) const noexcept override;
 
-	GCodeResult GetNetworkState(const StringRef& reply) override;
-	int EnableState() const override;
-	bool InNetworkStack() const override;
-	bool IsWiFiInterface() const override { return false; }
+	GCodeResult GetNetworkState(const StringRef& reply) noexcept override;
+	int EnableState() const noexcept override;
+	bool IsWiFiInterface() const noexcept override { return false; }
 
-	void UpdateHostname(const char *hostname) override;
-	IPAddress GetIPAddress() const override;
-	void SetIPAddress(IPAddress p_ipAddress, IPAddress p_netmask, IPAddress p_gateway) override;
-	void SetMacAddress(const uint8_t mac[]) override;
-	const uint8_t *GetMacAddress() const override { return macAddress; }
+	void UpdateHostname(const char *hostname) noexcept override;
+	IPAddress GetIPAddress() const noexcept override;
+	void SetIPAddress(IPAddress p_ipAddress, IPAddress p_netmask, IPAddress p_gateway) noexcept override;
+	GCodeResult SetMacAddress(const MacAddress& mac, const StringRef& reply) noexcept override;
+	const MacAddress& GetMacAddress() const noexcept override { return macAddress; }
 
 	// LwIP interfaces
-	bool ConnectionEstablished(tcp_pcb *pcb);
+	bool ConnectionEstablished(tcp_pcb *pcb) noexcept;
 
-	void OpenDataPort(Port port) override;
-	void TerminateDataPort() override;
+	void OpenDataPort(Port port) noexcept override;
+	void TerminateDataPort() noexcept override;
 
 protected:
 	DECLARE_OBJECT_MODEL
 
 private:
-	enum class NetworkState
-	{
-		disabled,					// Network disabled
-		enabled,					// Network enabled but not started yet
-		establishingLink,			// starting up, waiting for link
-		obtainingIP,				// link established, waiting for DHCP
-		connected,					// just established a connection
-		active						// network running
-	};
+	void Start() noexcept;
+	void Stop() noexcept;
+	void InitSockets() noexcept;
+	void TerminateSockets() noexcept;
 
-	void Start();
-	void Stop();
-	void InitSockets();
-	void TerminateSockets();
+	void RebuildMdnsServices() noexcept;
 
-	void RebuildMdnsServices();
-
-	void StartProtocol(NetworkProtocol protocol)
+	void StartProtocol(NetworkProtocol protocol) noexcept
 	pre(protocol < NumProtocols);
 
-	void ShutdownProtocol(NetworkProtocol protocol)
+	void ShutdownProtocol(NetworkProtocol protocol) noexcept
 	pre(protocol < NumProtocols);
 
-	void ReportOneProtocol(NetworkProtocol protocol, const StringRef& reply) const
+	void ReportOneProtocol(NetworkProtocol protocol, const StringRef& reply) const noexcept
 	pre(protocol < NumProtocols);
 
 	Platform& platform;
@@ -99,7 +87,6 @@ private:
 	bool closeDataPort;
 	tcp_pcb *listeningPcbs[NumTcpPorts];
 
-	NetworkState state;
 	bool activated;
 	bool initialised;
 	bool usingDhcp;
@@ -107,7 +94,7 @@ private:
 	IPAddress ipAddress;
 	IPAddress netmask;
 	IPAddress gateway;
-	uint8_t macAddress[6];
+	MacAddress macAddress;
 };
 
 #endif

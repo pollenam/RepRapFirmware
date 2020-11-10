@@ -16,7 +16,45 @@
 // is more likely to cause errors. This constant sets the delay required after a retract or reprime move before we accept the measurement.
 const int32_t SyncDelayMillis = 10;
 
-LaserFilamentMonitor::LaserFilamentMonitor(unsigned int extruder, unsigned int type)
+#if SUPPORT_OBJECT_MODEL
+
+// Object model table and functions
+// Note: if using GCC version 7.3.1 20180622 and lambda functions are used in this table, you must compile this file with option -std=gnu++17.
+// Otherwise the table will be allocated in RAM instead of flash, which wastes too much RAM.
+
+// Macro to build a standard lambda function that includes the necessary type conversions
+#define OBJECT_MODEL_FUNC(...) OBJECT_MODEL_FUNC_BODY(LaserFilamentMonitor, __VA_ARGS__)
+#define OBJECT_MODEL_FUNC_IF(...) OBJECT_MODEL_FUNC_IF_BODY(LaserFilamentMonitor, __VA_ARGS__)
+
+constexpr ObjectModelTableEntry LaserFilamentMonitor::objectModelTable[] =
+{
+	// Within each group, these entries must be in alphabetical order
+	// 0. LaserFilamentMonitor members
+	{ "calibrated", 		OBJECT_MODEL_FUNC_IF(self->dataReceived && self->HaveCalibrationData(), self, 1), 					ObjectModelEntryFlags::none },
+	{ "configured", 		OBJECT_MODEL_FUNC(self, 2), 																		ObjectModelEntryFlags::none },
+	{ "enabled",			OBJECT_MODEL_FUNC(self->comparisonEnabled),		 													ObjectModelEntryFlags::none },
+	{ "filamentPresent",	OBJECT_MODEL_FUNC_IF(self->switchOpenMask != 0, (self->sensorValue & self->switchOpenMask) == 0),	ObjectModelEntryFlags::live },
+	{ "type",				OBJECT_MODEL_FUNC_NOSELF("laser"), 																	ObjectModelEntryFlags::none },
+
+	// 1. LaserFilamentMonitor.calibrated members
+	{ "percentMax",			OBJECT_MODEL_FUNC(ConvertToPercent(self->maxMovementRatio)), 										ObjectModelEntryFlags::none },
+	{ "percentMin",			OBJECT_MODEL_FUNC(ConvertToPercent(self->minMovementRatio)), 										ObjectModelEntryFlags::none },
+	{ "sensitivity",		OBJECT_MODEL_FUNC(ConvertToPercent(self->MeasuredSensitivity())), 									ObjectModelEntryFlags::none },
+	{ "totalDistance",		OBJECT_MODEL_FUNC(self->totalExtrusionCommanded, 1), 												ObjectModelEntryFlags::none },
+
+	// 2. LaserFilamentMonitor.configured members
+	{ "percentMax",			OBJECT_MODEL_FUNC(ConvertToPercent(self->maxMovementAllowed)), 										ObjectModelEntryFlags::none },
+	{ "percentMin",			OBJECT_MODEL_FUNC(ConvertToPercent(self->minMovementAllowed)), 										ObjectModelEntryFlags::none },
+	{ "sampleDistance",	 	OBJECT_MODEL_FUNC(self->minimumExtrusionCheckLength, 1), 												ObjectModelEntryFlags::none },
+};
+
+constexpr uint8_t LaserFilamentMonitor::objectModelTableDescriptor[] = { 3, 5, 4, 3 };
+
+DEFINE_GET_OBJECT_MODEL_TABLE(LaserFilamentMonitor)
+
+#endif
+
+LaserFilamentMonitor::LaserFilamentMonitor(unsigned int extruder, unsigned int type) noexcept
 	: Duet3DFilamentMonitor(extruder, type),
 	  minMovementAllowed(DefaultMinMovementAllowed), maxMovementAllowed(DefaultMaxMovementAllowed),
 	  minimumExtrusionCheckLength(DefaultMinimumExtrusionCheckLength), comparisonEnabled(false), checkNonPrintingMoves(false)
@@ -25,7 +63,7 @@ LaserFilamentMonitor::LaserFilamentMonitor(unsigned int extruder, unsigned int t
 	Init();
 }
 
-void LaserFilamentMonitor::Init()
+void LaserFilamentMonitor::Init() noexcept
 {
 	dataReceived = false;
 	sensorValue = 0;
@@ -39,12 +77,22 @@ void LaserFilamentMonitor::Init()
 	Reset();
 }
 
-void LaserFilamentMonitor::Reset()
+void LaserFilamentMonitor::Reset() noexcept
 {
 	extrusionCommandedThisSegment = extrusionCommandedSinceLastSync = movementMeasuredThisSegment = movementMeasuredSinceLastSync = 0.0;
 	laserMonitorState = LaserMonitorState::idle;
 	haveStartBitData = false;
 	synced = false;							// force a resync
+}
+
+bool LaserFilamentMonitor::HaveCalibrationData() const noexcept
+{
+	return laserMonitorState != LaserMonitorState::calibrating && totalExtrusionCommanded > 10.0;
+}
+
+float LaserFilamentMonitor::MeasuredSensitivity() const noexcept
+{
+	return totalMovementMeasured/totalExtrusionCommanded;
 }
 
 // Configure this sensor, returning true if error and setting 'seen' if we processed any configuration parameters
@@ -88,6 +136,7 @@ bool LaserFilamentMonitor::Configure(GCodeBuffer& gb, const StringRef& reply, bo
 	if (seen)
 	{
 		Init();
+		reprap.SensorsUpdated();
 	}
 	else
 	{
@@ -95,8 +144,8 @@ bool LaserFilamentMonitor::Configure(GCodeBuffer& gb, const StringRef& reply, bo
 		GetPort().AppendPinName(reply);
 		reply.catf(", %s, allow %ld%% to %ld%%, check every %.1fmm, ",
 					(comparisonEnabled) ? "enabled" : "disabled",
-					lrintf(minMovementAllowed * 100.0),
-					lrintf(maxMovementAllowed * 100.0),
+					ConvertToPercent(minMovementAllowed),
+					ConvertToPercent(maxMovementAllowed),
 					(double)minimumExtrusionCheckLength);
 
 		if (!dataReceived)
@@ -122,12 +171,12 @@ bool LaserFilamentMonitor::Configure(GCodeBuffer& gb, const StringRef& reply, bo
 					reply.catf(" %u", lastErrorCode);
 				}
 			}
-			else if (laserMonitorState != LaserMonitorState::calibrating && totalExtrusionCommanded > 10.0)
+			else if (HaveCalibrationData())
 			{
 				reply.catf("measured min %ld%% avg %ld%% max %ld%% over %.1fmm",
-					lrintf(100 * minMovementRatio),
-					lrintf((100 * totalMovementMeasured)/totalExtrusionCommanded),
-					lrintf(100 * maxMovementRatio),
+					ConvertToPercent(minMovementRatio),
+					ConvertToPercent(MeasuredSensitivity()),
+					ConvertToPercent(maxMovementRatio),
 					(double)totalExtrusionCommanded);
 			}
 			else
@@ -141,7 +190,7 @@ bool LaserFilamentMonitor::Configure(GCodeBuffer& gb, const StringRef& reply, bo
 }
 
 // Return the current position
-float LaserFilamentMonitor::GetCurrentPosition() const
+float LaserFilamentMonitor::GetCurrentPosition() const noexcept
 {
 	const uint16_t positionRange = (sensorValue & TypeLaserLargeDataRangeBitMask) ? TypeLaserLargeRange : TypeLaserDefaultRange;
 	int32_t pos = (int32_t)(sensorValue & (positionRange - 1));
@@ -153,7 +202,7 @@ float LaserFilamentMonitor::GetCurrentPosition() const
 }
 
 // Deal with any received data
-void LaserFilamentMonitor::HandleIncomingData()
+void LaserFilamentMonitor::HandleIncomingData() noexcept
 {
 	uint16_t val;
 	PollResult res;
@@ -257,7 +306,7 @@ void LaserFilamentMonitor::HandleIncomingData()
 // 'filamentConsumed' is the net amount of extrusion commanded since the last call to this function.
 // 'hadNonPrintingMove' is true if filamentConsumed includes extruder movement from non-printing moves.
 // 'fromIsr' is true if this measurement was taken at the end of the ISR because a potential start bit was seen
-FilamentSensorStatus LaserFilamentMonitor::Check(bool isPrinting, bool fromIsr, uint32_t isrMillis, float filamentConsumed)
+FilamentSensorStatus LaserFilamentMonitor::Check(bool isPrinting, bool fromIsr, uint32_t isrMillis, float filamentConsumed) noexcept
 {
 	// 1. Update the extrusion commanded and whether we have had an extruding but non-printing move
 	extrusionCommandedSinceLastSync += filamentConsumed;
@@ -303,7 +352,7 @@ FilamentSensorStatus LaserFilamentMonitor::Check(bool isPrinting, bool fromIsr, 
 }
 
 // Compare the amount commanded with the amount of extrusion measured, and set up for the next comparison
-FilamentSensorStatus LaserFilamentMonitor::CheckFilament(float amountCommanded, float amountMeasured, bool overdue)
+FilamentSensorStatus LaserFilamentMonitor::CheckFilament(float amountCommanded, float amountMeasured, bool overdue) noexcept
 {
 	if (reprap.Debug(moduleFilamentSensors))
 	{
@@ -382,7 +431,7 @@ FilamentSensorStatus LaserFilamentMonitor::CheckFilament(float amountCommanded, 
 }
 
 // Clear the measurement state. Called when we are not printing a file. Return the present/not present status if available.
-FilamentSensorStatus LaserFilamentMonitor::Clear()
+FilamentSensorStatus LaserFilamentMonitor::Clear() noexcept
 {
 	Reset();											// call this first so that haveStartBitData and synced are false when we call HandleIncomingData
 	HandleIncomingData();								// to keep the diagnostics up to date
@@ -393,7 +442,7 @@ FilamentSensorStatus LaserFilamentMonitor::Clear()
 }
 
 // Print diagnostic info for this sensor
-void LaserFilamentMonitor::Diagnostics(MessageType mtype, unsigned int extruder)
+void LaserFilamentMonitor::Diagnostics(MessageType mtype, unsigned int extruder) noexcept
 {
 	String<FormatStringLength> buf;
 	buf.printf("Extruder %u: ", extruder);

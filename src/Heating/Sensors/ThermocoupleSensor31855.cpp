@@ -61,23 +61,22 @@ const uint8_t MAX31855_SpiMode = SPI_MODE_0;
 // Define the minimum interval between readings
 const uint32_t MinimumReadInterval = 100;		// minimum interval between reads, in milliseconds
 
-ThermocoupleSensor31855::ThermocoupleSensor31855(unsigned int sensorNum)
+ThermocoupleSensor31855::ThermocoupleSensor31855(unsigned int sensorNum) noexcept
 	: SpiTemperatureSensor(sensorNum, "Thermocouple (MAX31855)", MAX31855_SpiMode, MAX31855_Frequency)
 {
 }
 
 // Configure this temperature sensor
-GCodeResult ThermocoupleSensor31855::Configure(GCodeBuffer& gb, const StringRef& reply)
+GCodeResult ThermocoupleSensor31855::Configure(GCodeBuffer& gb, const StringRef& reply, bool& changed)
 {
-	bool seen = false;
-	if (!ConfigurePort(gb, reply, seen))
+	if (!ConfigurePort(gb, reply, changed))
 	{
 		return GCodeResult::error;
 	}
 
-	TryConfigureSensorName(gb, seen);
+	TryConfigureSensorName(gb, changed);
 
-	if (seen)
+	if (changed)
 	{
 		// Initialise the sensor
 		InitSpi();
@@ -90,7 +89,7 @@ GCodeResult ThermocoupleSensor31855::Configure(GCodeBuffer& gb, const StringRef&
 	return GCodeResult::ok;
 }
 
-void ThermocoupleSensor31855::Poll()
+void ThermocoupleSensor31855::Poll() noexcept
 {
 	uint32_t rawVal;
 	TemperatureError sts = DoSpiTransaction(nullptr, 4, rawVal);

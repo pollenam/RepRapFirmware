@@ -49,7 +49,7 @@ extern uint32_t _nocache_ram_end;
 
 static bool enabled = false;
 
-void Cache::Init()
+void Cache::Init() noexcept
 {
 #if SAME70
 
@@ -131,7 +131,7 @@ void Cache::Init()
 #endif
 }
 
-void Cache::Enable()
+void Cache::Enable() noexcept
 {
 	if (!enabled)
 	{
@@ -147,11 +147,12 @@ void Cache::Enable()
 	}
 }
 
-void Cache::Disable()
+void Cache::Disable() noexcept
 {
 	if (enabled)
 	{
 #if SAME70
+		SCB_CleanDCache();
 		SCB_DisableICache();
 		SCB_DisableDCache();
 #elif SAM4E
@@ -163,7 +164,7 @@ void Cache::Disable()
 
 #if SAME70
 
-void Cache::Flush(const volatile void *start, size_t length)
+void Cache::Flush(const volatile void *start, size_t length) noexcept
 {
 	if (enabled)
 	{
@@ -178,7 +179,7 @@ void Cache::Flush(const volatile void *start, size_t length)
 
 #endif
 
-void Cache::Invalidate(const volatile void *start, size_t length)
+void Cache::Invalidate(const volatile void *start, size_t length) noexcept
 {
 	if (enabled)
 	{
@@ -199,7 +200,7 @@ void Cache::Invalidate(const volatile void *start, size_t length)
 
 #if SAM4E
 
-uint32_t Cache::GetHitCount()
+uint32_t Cache::GetHitCount() noexcept
 {
 	return cmcc_get_monitor_cnt(CMCC);
 }
@@ -209,8 +210,8 @@ uint32_t Cache::GetHitCount()
 #endif
 
 // Entry points that can be called from ASF C code
-void CacheFlushBeforeDMAReceive(const volatile void *start, size_t length) { Cache::FlushBeforeDMAReceive(start, length); }
-void CacheInvalidateAfterDMAReceive(const volatile void *start, size_t length) { Cache::InvalidateAfterDMAReceive(start, length); }
-void CacheFlushBeforeDMASend(const volatile void *start, size_t length) { Cache::FlushBeforeDMASend(start, length); }
+void CacheFlushBeforeDMAReceive(const volatile void *start, size_t length) noexcept { Cache::FlushBeforeDMAReceive(start, length); }
+void CacheInvalidateAfterDMAReceive(const volatile void *start, size_t length) noexcept { Cache::InvalidateAfterDMAReceive(start, length); }
+void CacheFlushBeforeDMASend(const volatile void *start, size_t length) noexcept { Cache::FlushBeforeDMASend(start, length); }
 
 // End

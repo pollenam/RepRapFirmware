@@ -17,16 +17,31 @@
 #include "PrintMonitor.h"
 
 // Static data
-Mutex FilamentMonitor::filamentSensorsMutex;
+ReadWriteLock FilamentMonitor::filamentMonitorsLock;
 FilamentMonitor *FilamentMonitor::filamentSensors[MaxExtruders] = { 0 };
 
+#if SUPPORT_OBJECT_MODEL
+
+// Get the number of monitors to report in the OM
+size_t FilamentMonitor::GetNumMonitorsToReport()
+{
+	size_t rslt = ARRAY_SIZE(filamentSensors);
+	while (rslt != 0 && filamentSensors[rslt - 1] == nullptr)
+	{
+		--rslt;
+	}
+	return rslt;
+}
+
+#endif
+
 // Default destructor
-FilamentMonitor::~FilamentMonitor()
+FilamentMonitor::~FilamentMonitor() noexcept
 {
 }
 
 // Call this to disable the interrupt before deleting or re-configuring a filament monitor
-void FilamentMonitor::Disable()
+void FilamentMonitor::Disable() noexcept
 {
 	port.Release();
 }
@@ -60,20 +75,18 @@ bool FilamentMonitor::ConfigurePin(GCodeBuffer& gb, const StringRef& reply, Inte
 }
 
 // Static initialisation
-/*static*/ void FilamentMonitor::InitStatic()
+/*static*/ void FilamentMonitor::InitStatic() noexcept
 {
-	filamentSensorsMutex.Create("FilamentSensors");
 }
 
 // Handle M591
 /*static*/ GCodeResult FilamentMonitor::Configure(GCodeBuffer& gb, const StringRef& reply, unsigned int extruder)
 {
-
 	bool seen = false;
 	uint32_t newSensorType;
 	gb.TryGetUIValue('P', newSensorType, seen);
 
-	MutexLocker lock(filamentSensorsMutex);
+	WriteLocker lock(filamentMonitorsLock);
 	FilamentMonitor*& sensor = filamentSensors[extruder];
 
 	if (seen)
@@ -85,6 +98,7 @@ bool FilamentMonitor::ConfigurePin(GCodeBuffer& gb, const StringRef& reply, Inte
 			sensor->Disable();
 			delete sensor;
 			sensor = nullptr;
+			reprap.SensorsUpdated();
 		}
 
 		if (sensor == nullptr)
@@ -113,7 +127,7 @@ bool FilamentMonitor::ConfigurePin(GCodeBuffer& gb, const StringRef& reply, Inte
 }
 
 // Factory function
-/*static*/ FilamentMonitor *FilamentMonitor::Create(unsigned int extruder, unsigned int type)
+/*static*/ FilamentMonitor *FilamentMonitor::Create(unsigned int extruder, unsigned int type) noexcept
 {
 	switch (type)
 	{
@@ -140,7 +154,7 @@ bool FilamentMonitor::ConfigurePin(GCodeBuffer& gb, const StringRef& reply, Inte
 }
 
 // Return an error message corresponding to a status code
-/*static*/ const char *FilamentMonitor::GetErrorMessage(FilamentSensorStatus f)
+/*static*/ const char *FilamentMonitor::GetErrorMessage(FilamentSensorStatus f) noexcept
 {
 	switch(f)
 	{
@@ -154,7 +168,7 @@ bool FilamentMonitor::ConfigurePin(GCodeBuffer& gb, const StringRef& reply, Inte
 }
 
 // ISR
-/*static*/ void FilamentMonitor::InterruptEntry(CallbackParameter param)
+/*static*/ void FilamentMonitor::InterruptEntry(CallbackParameter param) noexcept
 {
 	FilamentMonitor * const fm = static_cast<FilamentMonitor*>(param.vp);
 	if (fm->Interrupt())
@@ -165,9 +179,9 @@ bool FilamentMonitor::ConfigurePin(GCodeBuffer& gb, const StringRef& reply, Inte
 	}
 }
 
-/*static*/ void FilamentMonitor::Spin()
+/*static*/ void FilamentMonitor::Spin() noexcept
 {
-	MutexLocker lock(filamentSensorsMutex);
+	ReadLocker lock(filamentMonitorsLock);
 
 	// Filament sensors
 	for (size_t extruder = 0; extruder < MaxExtruders; ++extruder)
@@ -222,7 +236,7 @@ bool FilamentMonitor::ConfigurePin(GCodeBuffer& gb, const StringRef& reply, Inte
 }
 
 // Send diagnostics info
-/*static*/ void FilamentMonitor::Diagnostics(MessageType mtype)
+/*static*/ void FilamentMonitor::Diagnostics(MessageType mtype) noexcept
 {
 	bool first = true;
 	for (size_t i = 0; i < MaxExtruders; ++i)

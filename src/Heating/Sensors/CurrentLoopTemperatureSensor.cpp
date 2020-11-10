@@ -18,7 +18,7 @@ const uint8_t MCP3204_SpiMode = SPI_MODE_0;
 // Define the minimum interval between readings
 const uint32_t MinimumReadInterval = 100;		// minimum interval between reads, in milliseconds
 
-CurrentLoopTemperatureSensor::CurrentLoopTemperatureSensor(unsigned int sensorNum)
+CurrentLoopTemperatureSensor::CurrentLoopTemperatureSensor(unsigned int sensorNum) noexcept
 	: SpiTemperatureSensor(sensorNum, "Current Loop", MCP3204_SpiMode, MCP3204_Frequency),
 	  tempAt4mA(DefaultTempAt4mA), tempAt20mA(DefaultTempAt20mA), chipChannel(DefaultChipChannel), isDifferential(false)
 {
@@ -26,21 +26,20 @@ CurrentLoopTemperatureSensor::CurrentLoopTemperatureSensor(unsigned int sensorNu
 }
 
 // Configure this temperature sensor
-GCodeResult CurrentLoopTemperatureSensor::Configure(GCodeBuffer& gb, const StringRef& reply)
+GCodeResult CurrentLoopTemperatureSensor::Configure(GCodeBuffer& gb, const StringRef& reply, bool& changed)
 {
-	bool seen = false;
-	if (!ConfigurePort(gb, reply, seen))
+	if (!ConfigurePort(gb, reply, changed))
 	{
 		return GCodeResult::error;
 	}
 
-	gb.TryGetFValue('L', tempAt4mA, seen);
-	gb.TryGetFValue('H', tempAt20mA, seen);
-	gb.TryGetUIValue('C', chipChannel, seen);
-	gb.TryGetUIValue('D', isDifferential, seen);
-	TryConfigureSensorName(gb, seen);
+	gb.TryGetFValue('L', tempAt4mA, changed);
+	gb.TryGetFValue('H', tempAt20mA, changed);
+	gb.TryGetUIValue('C', chipChannel, changed);
+	gb.TryGetUIValue('D', isDifferential, changed);
+	TryConfigureSensorName(gb, changed);
 
-	if (seen)
+	if (changed)
 	{
 		CalcDerivedParameters();
 
@@ -74,21 +73,21 @@ GCodeResult CurrentLoopTemperatureSensor::Configure(GCodeBuffer& gb, const Strin
 	return GCodeResult::ok;
 }
 
-void CurrentLoopTemperatureSensor::Poll()
+void CurrentLoopTemperatureSensor::Poll() noexcept
 {
 	float t;
 	const TemperatureError rslt = TryGetLinearAdcTemperature(t);
 	SetResult(t, rslt);
 }
 
-void CurrentLoopTemperatureSensor::CalcDerivedParameters()
+void CurrentLoopTemperatureSensor::CalcDerivedParameters() noexcept
 {
 	minLinearAdcTemp = tempAt4mA - 0.25 * (tempAt20mA - tempAt4mA);
 	linearAdcDegCPerCount = (tempAt20mA - minLinearAdcTemp) / 4096.0;
 }
 
 // Try to get a temperature reading from the linear ADC by doing an SPI transaction
-TemperatureError CurrentLoopTemperatureSensor::TryGetLinearAdcTemperature(float& t)
+TemperatureError CurrentLoopTemperatureSensor::TryGetLinearAdcTemperature(float& t) noexcept
 {
 	/*
 	 * The MCP3204 waits for a high input input bit before it does anything. Call this clock 1.
@@ -115,7 +114,7 @@ TemperatureError CurrentLoopTemperatureSensor::TryGetLinearAdcTemperature(float&
 	 */
 
 	const uint8_t channelByte = ((isDifferential) ? 0x80 : 0xC0) | (chipChannel * 0x08);
-	static const uint8_t adcData[] = { channelByte, 0x00, 0x00 };
+	const uint8_t adcData[] = { channelByte, 0x00, 0x00 };
 	uint32_t rawVal;
 	TemperatureError rslt = DoSpiTransaction(adcData, 3, rawVal);
 	//debugPrintf("ADC data %u\n", rawVal);

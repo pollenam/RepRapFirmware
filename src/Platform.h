@@ -25,9 +25,8 @@ Licence: GPL
 #define PLATFORM_H
 
 #include "RepRapFirmware.h"
-#include "SoftwareReset.h"
+#include "ObjectModel/ObjectModel.h"
 #include "Hardware/IoPorts.h"
-#include "DueFlashStorage.h"
 #include "Fans/FansManager.h"
 #include "Heating/TemperatureError.h"
 #include "OutputMemory.h"
@@ -37,6 +36,8 @@ Licence: GPL
 #include "MessageType.h"
 #include "Tools/Spindle.h"
 #include "Endstops/EndstopsManager.h"
+#include <GPIO/GpInPort.h>
+#include <GPIO/GpOutPort.h>
 #include <General/IPAddress.h>
 
 #if defined(DUET_NG)
@@ -47,6 +48,12 @@ Licence: GPL
 # include "DAC/DAC084S085.h"       // SPI DAC for motor current vref
 # include "EUI48/EUI48EEPROM.h"    // SPI EUI48 mac address EEPROM
 # include "Microstepping.h"
+#elif defined(__LPC17xx__)
+# include "MCP4461/MCP4461.h"
+#endif
+
+#if SUPPORT_CAN_EXPANSION
+# include <RemoteInputHandle.h>
 #endif
 
 #include <functional>
@@ -107,7 +114,8 @@ enum class BoardType : uint8_t
 {
 	Auto = 0,
 #if defined(DUET3)
-	Duet3 = 1
+	Duet3_v06_100 = 1,
+	Duet3_v101 = 2,
 #elif defined(SAME70XPLD)
 	SAME70XPLD_0 = 1
 #elif defined(DUET_NG)
@@ -127,6 +135,8 @@ enum class BoardType : uint8_t
 	PCCB_v10 = 1
 #elif defined(PCCB_08) || defined(PCCB_08_X5)
 	PCCB_v08 = 1
+#elif defined(__LPC17xx__)
+	Lpc = 1
 #else
 # error Unknown board
 #endif
@@ -135,7 +145,7 @@ enum class BoardType : uint8_t
 /***************************************************************************************************/
 
 // Enumeration to describe various tests we do in response to the M122 command
-enum class DiagnosticTestType : int
+enum class DiagnosticTestType : unsigned int
 {
 	PrintTestReport = 1,			// run some tests and report the processor ID
 
@@ -147,6 +157,11 @@ enum class DiagnosticTestType : int
 	TimeSinCos = 103,				// do a timing test on the trig functions
 	TimeSDWrite = 104,				// do a write timing test on the SD card
 	PrintObjectSizes = 105,			// print the sizes of various objects
+	PrintObjectAddresses = 106,		// print the addresses and sizes of various objects
+
+#ifdef __LPC17xx__
+    PrintBoardConfiguration = 200,    //Prints out all pin/values loaded from SDCard to configure board
+#endif
 
 	TestWatchdog = 1001,			// test that we get a watchdog reset if the tick interrupt stops
 	TestSpinLockup = 1002,			// test that we get a software reset if a Spin() function takes too long
@@ -163,12 +178,12 @@ enum class DiagnosticTestType : int
 template<size_t numAveraged> class AveragingFilter
 {
 public:
-	AveragingFilter()
+	AveragingFilter() noexcept
 	{
 		Init(0);
 	}
 
-	void Init(uint16_t val) volatile
+	void Init(uint16_t val) volatile noexcept
 	{
 		const irqflags_t flags = cpu_irq_save();
 		sum = (uint32_t)val * (uint32_t)numAveraged;
@@ -183,7 +198,7 @@ public:
 
 	// Call this to put a new reading into the filter
 	// This is only called by the ISR, so it not declared volatile to make it faster
-	void ProcessReading(uint16_t r)
+	void ProcessReading(uint16_t r) noexcept
 	{
 		sum = sum - readings[index] + r;
 		readings[index] = r;
@@ -196,26 +211,26 @@ public:
 	}
 
 	// Return the raw sum
-	uint32_t GetSum() const volatile
+	uint32_t GetSum() const volatile noexcept
 	{
 		return sum;
 	}
 
 	// Return true if we have a valid average
-	bool IsValid() const volatile
+	bool IsValid() const volatile noexcept
 	{
 		return isValid;
 	}
 
 	// Get the latest reading
-	uint16_t GetLatestReading() const volatile
+	uint16_t GetLatestReading() const volatile noexcept
 	{
 		size_t indexOfLastReading = index;			// capture volatile variable
 		indexOfLastReading =  (indexOfLastReading == 0) ? numAveraged - 1 : indexOfLastReading - 1;
 		return readings[indexOfLastReading];
 	}
 
-	static constexpr size_t NumAveraged() { return numAveraged; }
+	static constexpr size_t NumAveraged() noexcept { return numAveraged; }
 
 private:
 	uint16_t readings[numAveraged];
@@ -241,76 +256,91 @@ enum class ErrorCode : uint32_t
 
 struct AxisDriversConfig
 {
-	AxisDriversConfig() { numDrivers = 0; }
-	DriversBitmap GetDriversBitmap() const;
+	AxisDriversConfig() noexcept { numDrivers = 0; }
+	DriversBitmap GetDriversBitmap() const noexcept;
 
 	uint8_t numDrivers;								// Number of drivers assigned to each axis
 	DriverId driverNumbers[MaxDriversPerAxis];		// The driver numbers assigned - only the first numDrivers are meaningful
 };
 
 // The main class that defines the RepRap machine for the benefit of the other classes
-class Platform
+class Platform INHERIT_OBJECT_MODEL
 {
 public:
 	// Enumeration to describe the status of a drive
 	enum class DriverStatus : uint8_t { disabled, idle, enabled };
 
-	Platform();
+	Platform() noexcept;
+	Platform(const Platform&) = delete;
 
 //-------------------------------------------------------------------------------------------------------------
 
 	// These are the functions that form the interface between Platform and the rest of the firmware.
 
-	void Init();									// Set the machine up after a restart.  If called subsequently this should set the machine up as if
-													// it has just been restarted; it can do this by executing an actual restart if you like, but beware the loop of death...
-	void Spin();									// This gets called in the main loop and should do any housekeeping needed
-	void Exit();									// Shut down tidily. Calling Init after calling this should reset to the beginning
+	void Init() noexcept;									// Set the machine up after a restart.  If called subsequently this should set the machine up as if
+															// it has just been restarted; it can do this by executing an actual restart if you like, but beware the loop of death...
+	void Spin() noexcept;									// This gets called in the main loop and should do any housekeeping needed
+	void Exit() noexcept;									// Shut down tidily. Calling Init after calling this should reset to the beginning
 
-	void Diagnostics(MessageType mtype);
-	GCodeResult DiagnosticTest(GCodeBuffer& gb, const StringRef& reply, int d);
-	void LogError(ErrorCode e) { errorCodeBits |= (uint32_t)e; }
+	void Diagnostics(MessageType mtype) noexcept;
+	GCodeResult DiagnosticTest(GCodeBuffer& gb, const StringRef& reply, OutputBuffer*& buf, unsigned int d) THROWS(GCodeException);
+	bool WasDeliberateError() const noexcept { return deliberateError; }
+	void LogError(ErrorCode e) noexcept { errorCodeBits |= (uint32_t)e; }
 
-	[[noreturn]] void SoftwareReset(uint16_t reason, const uint32_t *stk = nullptr);
-	bool AtxPower() const;
-	void AtxPowerOn();
-	void AtxPowerOff(bool defer);
-	void SetBoardType(BoardType bt);
-	const char* GetElectronicsString() const;
-	const char* GetBoardString() const;
+	bool AtxPower() const noexcept;
+	void AtxPowerOn() noexcept;
+	void AtxPowerOff(bool defer) noexcept;
 
-#ifdef DUET_NG
-	bool IsDuetWiFi() const;
-	bool IsDueXPresent() const { return expansionBoard != ExpansionBoardType::none; }
+	BoardType GetBoardType() const noexcept { return board; }
+	void SetBoardType(BoardType bt) noexcept;
+	const char* GetElectronicsString() const noexcept;
+	const char* GetBoardString() const noexcept;
+
+#if SUPPORT_OBJECT_MODEL
+	size_t GetNumGpInputsToReport() const noexcept;
+	size_t GetNumGpOutputsToReport() const noexcept;
 #endif
 
-	const uint8_t *GetDefaultMacAddress() const { return defaultMacAddress; }
+#ifdef DUET_NG
+	bool IsDuetWiFi() const noexcept;
+	bool IsDueXPresent() const noexcept { return expansionBoard != ExpansionBoardType::none; }
+	const char *GetBoardName() const;
+	const char *GetBoardShortName() const;
+#endif
+
+	const MacAddress& GetDefaultMacAddress() const noexcept { return defaultMacAddress; }
 
 	// Timing
-	void Tick() __attribute__((hot));						// Process a systick interrupt
+	void Tick() noexcept __attribute__((hot));						// Process a systick interrupt
 
 	// Real-time clock
-	bool IsDateTimeSet() const { return realTime != 0; }	// Has the RTC been set yet?
-	time_t GetDateTime() const { return realTime; }			// Retrieves the current RTC datetime and returns true if it's valid
-	bool SetDateTime(time_t time);							// Sets the current RTC date and time or returns false on error
+	bool IsDateTimeSet() const noexcept { return realTime != 0; }	// Has the RTC been set yet?
+	time_t GetDateTime() const noexcept { return realTime; }		// Retrieves the current RTC datetime
+	bool GetDateTime(tm& rslt) const noexcept { return gmtime_r(&realTime, &rslt) != nullptr && realTime != 0; }
+																	// Retrieves the broken-down current RTC datetime and returns true if it's valid
+	bool SetDateTime(time_t time) noexcept;							// Sets the current RTC date and time or returns false on error
 
   	// Communications and data storage
-	OutputBuffer *GetAuxGCodeReply();						// Returns cached G-Code reply for AUX devices and clears its reference
-	void AppendAuxReply(OutputBuffer *buf, bool rawMessage);
-	void AppendAuxReply(const char *msg, bool rawMessage);
-    uint32_t GetAuxSeq() { return auxSeq; }
-    bool HaveAux() const { return auxDetected; }			// Any device on the AUX line?
-    void SetAuxDetected() { auxDetected = true; }
+	void AppendUsbReply(OutputBuffer *buffer) noexcept;
+	void AppendAuxReply(OutputBuffer *buf, bool rawMessage) noexcept;
+	void AppendAuxReply(const char *msg, bool rawMessage) noexcept;
 
-	void SetIPAddress(IPAddress ip);
-	IPAddress GetIPAddress() const;
-	void SetNetMask(IPAddress nm);
-	IPAddress NetMask() const;
-	void SetGateWay(IPAddress gw);
-	IPAddress GateWay() const;
-	void SetBaudRate(size_t chan, uint32_t br);
-	uint32_t GetBaudRate(size_t chan) const;
-	void SetCommsProperties(size_t chan, uint32_t cp);
-	uint32_t GetCommsProperties(size_t chan) const;
+    bool IsAuxEnabled() const noexcept { return auxEnabled; }		// Any device on the AUX line?
+    void EnableAux() noexcept;
+    bool IsAuxRaw() const noexcept { return auxRaw; }
+	void SetAuxRaw(bool raw) noexcept { auxRaw = raw; }
+	void ResetChannel(size_t chan) noexcept;						// Re-initialise a serial channel
+
+	void SetIPAddress(IPAddress ip) noexcept;
+	IPAddress GetIPAddress() const noexcept;
+	void SetNetMask(IPAddress nm) noexcept;
+	IPAddress NetMask() const noexcept;
+	void SetGateWay(IPAddress gw) noexcept;
+	IPAddress GateWay() const noexcept;
+	void SetBaudRate(size_t chan, uint32_t br) noexcept;
+	uint32_t GetBaudRate(size_t chan) const noexcept;
+	void SetCommsProperties(size_t chan, uint32_t cp) noexcept;
+	uint32_t GetCommsProperties(size_t chan) const noexcept;
 
 #if defined(__ALLIGATOR__)
 	// Mac address from EUI48 EEPROM
@@ -318,241 +348,245 @@ public:
 #endif
 
 	// File functions
-	const char* GetConfigFile() const; 				// Where the configuration is stored (in the system dir).
-
 #if HAS_MASS_STORAGE
-	FileStore* OpenFile(const char* folder, const char* fileName, OpenMode mode, uint32_t preAllocSize = 0) const;
-	bool Delete(const char* folder, const char *filename) const;
-	bool FileExists(const char* folder, const char *filename) const;
-	bool DirectoryExists(const char *folder, const char *dir) const;
+	FileStore* OpenFile(const char* folder, const char* fileName, OpenMode mode, uint32_t preAllocSize = 0) const noexcept;
+	bool Delete(const char* folder, const char *filename) const noexcept;
+	bool FileExists(const char* folder, const char *filename) const noexcept;
+	bool DirectoryExists(const char *folder, const char *dir) const noexcept;
 
-	const char* GetWebDir() const; 					// Where the html etc files are
-	const char* GetGCodeDir() const; 				// Where the gcodes are
-	const char* GetMacroDir() const;				// Where the user-defined macros are
-	const char* GetDefaultFile() const;				// Where the default configuration is stored (in the system dir).
+	const char* GetWebDir() const noexcept; 					// Where the html etc files are
+	const char* GetGCodeDir() const noexcept; 					// Where the gcodes are
+	const char* GetMacroDir() const noexcept;					// Where the user-defined macros are
 
 	// Functions to work with the system files folder
-	GCodeResult SetSysDir(const char* dir, const StringRef& reply);				// Set the system files path
-	bool SysFileExists(const char *filename) const;
-	FileStore* OpenSysFile(const char *filename, OpenMode mode) const;
-	bool DeleteSysFile(const char *filename) const;
-	bool MakeSysFileName(const StringRef& result, const char *filename) const;
-	void GetSysDir(const StringRef & path) const;
+	GCodeResult SetSysDir(const char* dir, const StringRef& reply) noexcept;				// Set the system files path
+	bool SysFileExists(const char *filename) const noexcept;
+	FileStore* OpenSysFile(const char *filename, OpenMode mode) const noexcept;
+	bool DeleteSysFile(const char *filename) const noexcept;
+	bool MakeSysFileName(const StringRef& result, const char *filename) const noexcept;
+	void AppendSysDir(const StringRef & path) const noexcept;
+	void EncodeSysDir(OutputBuffer *buf) const noexcept;
 #endif
 
 	// Message output (see MessageType for further details)
-	void Message(MessageType type, const char *message);
-	void Message(MessageType type, OutputBuffer *buffer);
-	void MessageF(MessageType type, const char *fmt, ...) __attribute__ ((format (printf, 3, 4)));
-	void MessageF(MessageType type, const char *fmt, va_list vargs);
-	bool FlushAuxMessages();
-	bool FlushMessages();							// Flush messages to USB and aux, returning true if there is more to send
-	void SendAlert(MessageType mt, const char *message, const char *title, int sParam, float tParam, AxesBitmap controls);
-	void StopLogging();
+	void Message(MessageType type, const char *message) noexcept;
+	void Message(MessageType type, OutputBuffer *buffer) noexcept;
+	void MessageF(MessageType type, const char *fmt, ...) noexcept __attribute__ ((format (printf, 3, 4)));
+	void MessageF(MessageType type, const char *fmt, va_list vargs) noexcept;
+	bool FlushAuxMessages() noexcept;
+	bool FlushMessages() noexcept;							// Flush messages to USB and aux, returning true if there is more to send
+	void SendAlert(MessageType mt, const char *message, const char *title, int sParam, float tParam, AxesBitmap controls) noexcept;
+	void StopLogging() noexcept;
 
 	// Movement
-	void EmergencyStop();
-	void SetDirection(size_t axisOrExtruder, bool direction);
-	void SetDirectionValue(size_t driver, bool dVal);
-	bool GetDirectionValue(size_t driver) const;
-	void SetEnableValue(size_t driver, int8_t eVal);
-	int8_t GetEnableValue(size_t driver) const;
-	void EnableLocalDrivers(size_t axisOrExtruder);
-	void EnableOneLocalDriver(size_t driver, float requiredCurrent);
-	void DisableAllDrivers();
-	void DisableDrivers(size_t axisOrExtruder);
-	void DisableOneLocalDriver(size_t driver);
-	void EmergencyDisableDrivers();
-	void SetDriversIdle();
-	bool SetMotorCurrent(size_t axisOrExtruder, float current, int code, const StringRef& reply);
-	float GetMotorCurrent(size_t axisOrExtruder, int code) const;
-	void SetIdleCurrentFactor(float f);
-	float GetIdleCurrentFactor() const
+	void EmergencyStop() noexcept;
+	void SetDirection(size_t axisOrExtruder, bool direction) noexcept;
+	void SetDirectionValue(size_t driver, bool dVal) noexcept;
+	bool GetDirectionValue(size_t driver) const noexcept;
+	void SetDriverAbsoluteDirection(size_t driver, bool dVal) noexcept;
+	void SetEnableValue(size_t driver, int8_t eVal) noexcept;
+	int8_t GetEnableValue(size_t driver) const noexcept;
+	void EnableLocalDrivers(size_t axisOrExtruder) noexcept;
+	void EnableOneLocalDriver(size_t driver, float requiredCurrent) noexcept;
+	void DisableAllDrivers() noexcept;
+	void DisableDrivers(size_t axisOrExtruder) noexcept;
+	void DisableOneLocalDriver(size_t driver) noexcept;
+	void EmergencyDisableDrivers() noexcept;
+	void SetDriversIdle() noexcept;
+	bool SetMotorCurrent(size_t axisOrExtruder, float current, int code, const StringRef& reply) noexcept;
+	float GetMotorCurrent(size_t axisOrExtruder, int code) const noexcept;
+	void SetIdleCurrentFactor(float f) noexcept;
+	float GetIdleCurrentFactor() const noexcept
 		{ return idleCurrentFactor; }
-	bool SetDriverMicrostepping(size_t driver, unsigned int microsteps, int mode);
-	bool SetMicrostepping(size_t axisOrExtruder, int microsteps, bool mode, const StringRef& reply);
-	unsigned int GetMicrostepping(size_t axisOrExtruder, bool& interpolation) const;
-	void SetDriverStepTiming(size_t driver, const float microseconds[4]);
-	bool GetDriverStepTiming(size_t driver, float microseconds[4]) const;
-	float DriveStepsPerUnit(size_t axisOrExtruder) const;
-	const float *GetDriveStepsPerUnit() const
+	bool SetDriverMicrostepping(size_t driver, unsigned int microsteps, int mode) noexcept;
+	bool SetMicrostepping(size_t axisOrExtruder, int microsteps, bool mode, const StringRef& reply) noexcept;
+	unsigned int GetMicrostepping(size_t axisOrExtruder, bool& interpolation) const noexcept;
+	void SetDriverStepTiming(size_t driver, const float microseconds[4]) noexcept;
+	bool GetDriverStepTiming(size_t driver, float microseconds[4]) const noexcept;
+	float DriveStepsPerUnit(size_t axisOrExtruder) const noexcept;
+	const float *GetDriveStepsPerUnit() const noexcept
 		{ return driveStepsPerUnit; }
-	void SetDriveStepsPerUnit(size_t axisOrExtruder, float value, uint32_t requestedMicrostepping);
-	float Acceleration(size_t axisOrExtruder) const;
-	const float* Accelerations() const;
-	void SetAcceleration(size_t axisOrExtruder, float value);
-	float MaxFeedrate(size_t axisOrExtruder) const;
-	const float* MaxFeedrates() const { return maxFeedrates; }
-	void SetMaxFeedrate(size_t axisOrExtruder, float value);
-	float MinMovementSpeed() const { return minimumMovementSpeed; }
-	void SetMinMovementSpeed(float value) { minimumMovementSpeed = max<float>(value, 0.01); }
-	float GetInstantDv(size_t axis) const;
-	void SetInstantDv(size_t axis, float value);
-	float AxisMaximum(size_t axis) const;
-	void SetAxisMaximum(size_t axis, float value, bool byProbing);
-	float AxisMinimum(size_t axis) const;
-	void SetAxisMinimum(size_t axis, float value, bool byProbing);
-	float AxisTotalLength(size_t axis) const;
-	float GetPressureAdvance(size_t extruder) const;
+	void SetDriveStepsPerUnit(size_t axisOrExtruder, float value, uint32_t requestedMicrostepping) noexcept;
+	float Acceleration(size_t axisOrExtruder) const noexcept;
+	const float* Accelerations() const noexcept;
+	void SetAcceleration(size_t axisOrExtruder, float value) noexcept;
+	float MaxFeedrate(size_t axisOrExtruder) const noexcept;
+	const float* MaxFeedrates() const noexcept { return maxFeedrates; }
+	void SetMaxFeedrate(size_t axisOrExtruder, float value) noexcept;
+	float MinMovementSpeed() const noexcept { return minimumMovementSpeed; }
+	void SetMinMovementSpeed(float value) noexcept { minimumMovementSpeed = max<float>(value, 0.01); }
+	float GetInstantDv(size_t axis) const noexcept;
+	void SetInstantDv(size_t axis, float value) noexcept;
+	float AxisMaximum(size_t axis) const noexcept;
+	void SetAxisMaximum(size_t axis, float value, bool byProbing) noexcept;
+	float AxisMinimum(size_t axis) const noexcept;
+	void SetAxisMinimum(size_t axis, float value, bool byProbing) noexcept;
+	float AxisTotalLength(size_t axis) const noexcept;
+	float GetPressureAdvance(size_t extruder) const noexcept;
 	GCodeResult SetPressureAdvance(float advance, GCodeBuffer& gb, const StringRef& reply);
 
-	const AxisDriversConfig& GetAxisDriversConfig(size_t axis) const
+	const AxisDriversConfig& GetAxisDriversConfig(size_t axis) const noexcept
 		pre(axis < MaxAxes)
 		{ return axisDrivers[axis]; }
-	void SetAxisDriversConfig(size_t axis, size_t numValues, const DriverId driverNumbers[])
+	void SetAxisDriversConfig(size_t axis, size_t numValues, const DriverId driverNumbers[]) noexcept
 		pre(axis < MaxAxes);
-	DriverId GetExtruderDriver(size_t extruder) const
+	DriverId GetExtruderDriver(size_t extruder) const noexcept
 		pre(extruder < MaxExtruders)
 		{ return extruderDrivers[extruder]; }
-	void SetExtruderDriver(size_t extruder, DriverId driver)
+	void SetExtruderDriver(size_t extruder, DriverId driver) noexcept
 		pre(extruder < MaxExtruders);
-	uint32_t GetDriversBitmap(size_t axisOrExtruder) const	// get the bitmap of driver step bits for this axis or extruder
+	uint32_t GetDriversBitmap(size_t axisOrExtruder) const noexcept	// get the bitmap of driver step bits for this axis or extruder
 		pre(axisOrExtruder < MaxAxesPlusExtruders + NumLocalDrivers)
 		{ return driveDriverBits[axisOrExtruder]; }
-	uint32_t GetSlowDriversBitmap() const { return slowDriversBitmap; }
-	uint32_t GetSlowDriverStepHighClocks() const { return slowDriverStepTimingClocks[0]; }
-	uint32_t GetSlowDriverStepLowClocks() const { return slowDriverStepTimingClocks[1]; }
-	uint32_t GetSlowDriverDirSetupClocks() const { return slowDriverStepTimingClocks[2]; }
-	uint32_t GetSlowDriverDirHoldClocks() const { return slowDriverStepTimingClocks[3]; }
-	uint32_t GetSteppingEnabledDrivers() const { return steppingEnabledDriversBitmap; }
-	void DisableSteppingDriver(uint8_t driver) { steppingEnabledDriversBitmap &= ~StepPins::CalcDriverBitmap(driver); }
-	void EnableAllSteppingDrivers() { steppingEnabledDriversBitmap = 0xFFFFFFFF; }
+	uint32_t GetSlowDriversBitmap() const noexcept { return slowDriversBitmap; }
+	uint32_t GetSlowDriverStepHighClocks() const noexcept { return slowDriverStepTimingClocks[0]; }
+	uint32_t GetSlowDriverStepLowClocks() const noexcept { return slowDriverStepTimingClocks[1]; }
+	uint32_t GetSlowDriverDirSetupClocks() const noexcept { return slowDriverStepTimingClocks[2]; }
+	uint32_t GetSlowDriverDirHoldClocks() const noexcept { return slowDriverStepTimingClocks[3]; }
+	uint32_t GetSteppingEnabledDrivers() const noexcept { return steppingEnabledDriversBitmap; }
+	void DisableSteppingDriver(uint8_t driver) noexcept { steppingEnabledDriversBitmap &= ~StepPins::CalcDriverBitmap(driver); }
+	void EnableAllSteppingDrivers() noexcept { steppingEnabledDriversBitmap = 0xFFFFFFFF; }
 
 #if SUPPORT_NONLINEAR_EXTRUSION
-	bool GetExtrusionCoefficients(size_t extruder, float& a, float& b, float& limit) const;
-	void SetNonlinearExtrusion(size_t extruder, float a, float b, float limit);
+	bool GetExtrusionCoefficients(size_t extruder, float& a, float& b, float& limit) const noexcept;
+	void SetNonlinearExtrusion(size_t extruder, float a, float b, float limit) noexcept;
 #endif
 
 	// Endstops and Z probe
-	EndstopsManager& GetEndstops() { return endstops; }
-	ZProbe& GetCurrentZProbe() { return endstops.GetCurrentZProbe(); }
-	ZProbeType GetCurrentZProbeType() const;
-	void InitZProbeFilters();
-	const volatile ZProbeAveragingFilter& GetZProbeOnFilter() const { return zProbeOnFilter; }
-	const volatile ZProbeAveragingFilter& GetZProbeOffFilter() const { return zProbeOffFilter; }
+	EndstopsManager& GetEndstops() noexcept { return endstops; }
+	ReadLockedPointer<ZProbe> GetZProbeOrDefault(size_t probeNumber) noexcept { return endstops.GetZProbeOrDefault(probeNumber); }
+	void InitZProbeFilters() noexcept;
+	const volatile ZProbeAveragingFilter& GetZProbeOnFilter() const noexcept { return zProbeOnFilter; }
+	const volatile ZProbeAveragingFilter& GetZProbeOffFilter() const  noexcept{ return zProbeOffFilter; }
 
 #if HAS_MASS_STORAGE
-	bool WritePlatformParameters(FileStore *f, bool includingG31) const;
+	bool WritePlatformParameters(FileStore *f, bool includingG31) const noexcept;
 #endif
 
 	// Heat and temperature
-	volatile ThermistorAveragingFilter& GetAdcFilter(size_t channel)
+	volatile ThermistorAveragingFilter& GetAdcFilter(size_t channel) noexcept
 	pre(channel < ARRAY_SIZE(adcFilters))
 	{
 		return adcFilters[channel];
 	}
 
-	int GetAveragingFilterIndex(const IoPort&) const;
+	int GetAveragingFilterIndex(const IoPort&) const noexcept;
 
-	void UpdateConfiguredHeaters();
-
-	// Flash operations
-	void UpdateFirmware();
-	void StartIap();
-	bool CheckFirmwareUpdatePrerequisites(const StringRef& reply);
+	void UpdateConfiguredHeaters() noexcept;
 
 	// AUX device
-	void Beep(int freq, int ms);
-	void SendAuxMessage(const char* msg);
+	void Beep(int freq, int ms) noexcept;
+	void SendAuxMessage(const char* msg) noexcept;
 
 	// Hotend configuration
-	float GetFilamentWidth() const;
-	void SetFilamentWidth(float width);
-	float GetNozzleDiameter() const;
-	void SetNozzleDiameter(float diameter);
+	float GetFilamentWidth() const noexcept;
+	void SetFilamentWidth(float width) noexcept;
+	float GetNozzleDiameter() const noexcept;
+	void SetNozzleDiameter(float diameter) noexcept;
 
 	// Fire the inkjet (if any) in the given pattern
 	// If there is no inkjet false is returned; if there is one this returns true
 	// So you can test for inkjet presence with if(platform->Inkjet(0))
-	bool Inkjet(int bitPattern);
+	bool Inkjet(int bitPattern) noexcept;
 
 	// MCU temperature
 #if HAS_CPU_TEMP_SENSOR
-	void GetMcuTemperatures(float& minT, float& currT, float& maxT) const;
-	void SetMcuTemperatureAdjust(float v) { mcuTemperatureAdjust = v; }
-	float GetMcuTemperatureAdjust() const { return mcuTemperatureAdjust; }
+	MinMaxCurrent GetMcuTemperatures() const noexcept;
+	void SetMcuTemperatureAdjust(float v) noexcept { mcuTemperatureAdjust = v; }
+	float GetMcuTemperatureAdjust() const noexcept { return mcuTemperatureAdjust; }
 #endif
 
 #if HAS_VOLTAGE_MONITOR
 	// Power in voltage
-	void GetPowerVoltages(float& minV, float& currV, float& maxV) const;
-	float GetCurrentPowerVoltage() const;
-	bool IsPowerOk() const;
-	void DisableAutoSave();
-	void EnableAutoSave(float saveVoltage, float resumeVoltage);
-	bool GetAutoSaveSettings(float& saveVoltage, float&resumeVoltage);
+	MinMaxCurrent GetPowerVoltages() const noexcept;
+	float GetCurrentPowerVoltage() const noexcept;
+	bool IsPowerOk() const noexcept;
+	void DisableAutoSave() noexcept;
+	void EnableAutoSave(float saveVoltage, float resumeVoltage) noexcept;
+	bool GetAutoSaveSettings(float& saveVoltage, float&resumeVoltage) noexcept;
 #endif
 
 #if HAS_12V_MONITOR
 	// 12V rail voltage
-	void GetV12Voltages(float& minV, float& currV, float& maxV) const;
+	MinMaxCurrent GetV12Voltages() const noexcept;
 #endif
 
 #if HAS_SMART_DRIVERS
-	float GetTmcDriversTemperature(unsigned int board) const;
-	void DriverCoolingFansOnOff(uint32_t driverChannelsMonitored, bool on);
-	unsigned int GetNumSmartDrivers() const { return numSmartDrivers; }
+	float GetTmcDriversTemperature(unsigned int board) const noexcept;
+	void DriverCoolingFansOnOff(DriverChannelsBitmap driverChannelsMonitored, bool on) noexcept;
+	unsigned int GetNumSmartDrivers() const noexcept { return numSmartDrivers; }
 #endif
 
 #if HAS_VOLTAGE_MONITOR || HAS_12V_MONITOR
-	bool HasVinPower() const;
+	bool HasVinPower() const noexcept;
 #else
-	bool HasVinPower() const { return true; }
+	bool HasVinPower() const noexcept { return true; }
 #endif
 
 #if HAS_STALL_DETECT
-	GCodeResult ConfigureStallDetection(GCodeBuffer& gb, const StringRef& reply, OutputBuffer *& buf);
+	GCodeResult ConfigureStallDetection(GCodeBuffer& gb, const StringRef& reply, OutputBuffer *& buf) THROWS(GCodeException);
 #endif
 
 #if HAS_MASS_STORAGE
 	// Logging support
-	GCodeResult ConfigureLogging(GCodeBuffer& gb, const StringRef& reply);
+	GCodeResult ConfigureLogging(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException);
+	const char *GetLogFileName() const noexcept;
 #endif
 
 	// Ancillary PWM
-	GCodeResult GetSetAncillaryPwm(GCodeBuffer& gb, const StringRef& reply);
-	void ExtrudeOn();
-	void ExtrudeOff();
+	GCodeResult GetSetAncillaryPwm(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException);
+	void ExtrudeOn() noexcept;
+	void ExtrudeOff() noexcept;
 
 	// CNC and laser support
-	Spindle& AccessSpindle(size_t slot) { return spindles[slot]; }
+	Spindle& AccessSpindle(size_t slot) noexcept { return spindles[slot]; }
 
-	void SetLaserPwm(Pwm_t pwm);
-	float GetLaserPwm() const;							// return laser PWM in 0..1
+#if SUPPORT_LASER
+	void SetLaserPwm(Pwm_t pwm) noexcept;
+	float GetLaserPwm() const noexcept;							// return laser PWM in 0..1
 	bool AssignLaserPin(GCodeBuffer& gb, const StringRef& reply);
-	void SetLaserPwmFrequency(PwmFrequency freq);
-
-	// Misc
-	GCodeResult ConfigurePort(GCodeBuffer& gb, const StringRef& reply);
-	const PwmPort& GetGpioPort(size_t gpioPortNumber) const pre(gpioPortNumber > MaxGpioPorts) { return gpioPorts[gpioPortNumber]; }
-
-#if SAM4E || SAM4S || SAME70
-	uint32_t Random();
-	void PrintUniqueId(MessageType mtype);
+	void SetLaserPwmFrequency(PwmFrequency freq) noexcept;
 #endif
 
-private:
-	Platform(const Platform&);						// private copy constructor to make sure we don't try to copy a Platform
+	// Misc
+	GCodeResult ConfigurePort(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException);
 
-	const char* InternalGetSysDir() const;  		// where the system files are - not thread-safe!
+	GpOutputPort& GetGpOutPort(size_t gpoutPortNumber) noexcept
+		pre(gpioPortNumber < MaxGpOutPorts)	{ return gpoutPorts[gpoutPortNumber]; }
+	const GpInputPort& GetGpInPort(size_t gpinPortNumber) const noexcept
+		pre(gpinPortNumber < MaxGpInPorts) 	{ return gpinPorts[gpinPortNumber]; }
 
-	void RawMessage(MessageType type, const char *message);	// called by Message after handling error/warning flags
-
-	void ResetChannel(size_t chan);					// re-initialise a serial channel
-	float AdcReadingToCpuTemperature(uint32_t reading) const;
-
-	GCodeResult ConfigureGpioOrServo(uint32_t gpioNumber, bool isServo, GCodeBuffer& gb, const StringRef& reply);
+#if SUPPORTS_UNIQUE_ID
+	uint32_t Random() noexcept;
+	const char *GetUniqueIdString() const noexcept { return uniqueIdChars; }
+#endif
 
 #if SUPPORT_CAN_EXPANSION
-	void IterateDrivers(size_t axisOrExtruder, std::function<void(uint8_t)> localFunc, std::function<void(DriverId)> remoteFunc);
-	void IterateLocalDrivers(size_t axisOrExtruder, std::function<void(uint8_t)> func) { IterateDrivers(axisOrExtruder, func, [](DriverId){}); }
+	void HandleRemoteGpInChange(CanAddress src, uint8_t handleMajor, uint8_t handleMinor, bool state) noexcept;
+#endif
+
+protected:
+	DECLARE_OBJECT_MODEL
+	OBJECT_MODEL_ARRAY(axisDrivers)
+	OBJECT_MODEL_ARRAY(workplaceOffsets)
+
+private:
+	const char* InternalGetSysDir() const noexcept;  					// where the system files are - not thread-safe!
+
+	void RawMessage(MessageType type, const char *message) noexcept;	// called by Message after handling error/warning flags
+
+	float AdcReadingToCpuTemperature(uint32_t reading) const noexcept;
+
+#if SUPPORT_CAN_EXPANSION
+	void IterateDrivers(size_t axisOrExtruder, std::function<void(uint8_t) /*noexcept*/ > localFunc, std::function<void(DriverId) /*noexcept*/ > remoteFunc) noexcept;
+	void IterateLocalDrivers(size_t axisOrExtruder, std::function<void(uint8_t) /*noexcept*/ > func) noexcept { IterateDrivers(axisOrExtruder, func, [](DriverId){}); }
 #else
-	void IterateDrivers(size_t axisOrExtruder, std::function<void(uint8_t)> localFunc);
-	void IterateLocalDrivers(size_t axisOrExtruder, std::function<void(uint8_t)> func) { IterateDrivers(axisOrExtruder, func); }
+	void IterateDrivers(size_t axisOrExtruder, std::function<void(uint8_t) /*noexcept*/ > localFunc) noexcept;
+	void IterateLocalDrivers(size_t axisOrExtruder, std::function<void(uint8_t) /*noexcept*/ > func) noexcept { IterateDrivers(axisOrExtruder, func); }
 #endif
 
 #if HAS_SMART_DRIVERS
-	void ReportDrivers(MessageType mt, DriversBitmap& whichDrivers, const char* text, bool& reported);
+	void ReportDrivers(MessageType mt, DriversBitmap& whichDrivers, const char* text, bool& reported) noexcept;
 #endif
 
 #if HAS_MASS_STORAGE
@@ -564,12 +598,14 @@ private:
 	IPAddress ipAddress;
 	IPAddress netMask;
 	IPAddress gateWay;
-	uint8_t defaultMacAddress[6];
+	MacAddress defaultMacAddress;
 
 	// Board and processor
-#if SAM4E || SAM4S || SAME70
+#if SUPPORTS_UNIQUE_ID
 	uint32_t uniqueId[5];
+	char uniqueIdChars[30 + 5 + 1];			// 30 characters, 5 separators, 1 null terminator
 #endif
+
 	BoardType board;
 
 #ifdef DUET_NG
@@ -579,11 +615,11 @@ private:
 	bool active;
 	uint32_t errorCodeBits;
 
-	void InitialiseInterrupts();
+	void InitialiseInterrupts() noexcept;
 
 	// Drives
-	void UpdateMotorCurrent(size_t driver, float current);
-	void SetDriverDirection(uint8_t driver, bool direction)
+	void UpdateMotorCurrent(size_t driver, float current) noexcept;
+	void SetDriverDirection(uint8_t driver, bool direction) noexcept
 	pre(driver < DRIVES);
 
 	bool directions[NumDirectDrivers];
@@ -591,7 +627,7 @@ private:
 
 	float motorCurrents[MaxAxesPlusExtruders];				// the normal motor current for each stepper driver
 	float motorCurrentFraction[MaxAxesPlusExtruders];		// the percentages of normal motor current that each driver is set to
-	float standstillCurrentFraction[MaxAxesPlusExtruders];	// the percentages of normal motor current that each driver uses when in standstill
+	float standstillCurrentPercent[MaxAxesPlusExtruders];	// the percentages of normal motor current that each driver uses when in standstill
 	uint16_t microstepping[MaxAxesPlusExtruders];			// the microstepping used for each axis or extruder, top bit is set if interpolation enabled
 
 	volatile DriverStatus driverState[MaxAxesPlusExtruders];
@@ -647,6 +683,8 @@ private:
 	Pin spiDacCS[MaxSpiDac];
 	DAC084S085 dacAlligator;
 	DAC084S085 dacPiggy;
+#elif defined(__LPC17xx__)
+	MCP4461 mcp4451;// works for 5561 (only volatile setting commands)
 #endif
 
 	// Endstops
@@ -657,7 +695,8 @@ private:
 	volatile ZProbeAveragingFilter zProbeOffFilter;					// Z probe readings we took with the IR turned off
 
 	// GPIO pins
-	PwmPort gpioPorts[MaxGpioPorts];
+	GpOutputPort gpoutPorts[MaxGpOutPorts];
+	GpInputPort gpinPorts[MaxGpInPorts];
 
 	// Thermistors and temperature monitoring
 	volatile ThermistorAveragingFilter adcFilters[NumAdcFilters];	// ADC reading averaging filters
@@ -673,7 +712,7 @@ private:
 	AxesBitmap axisMinimaProbed, axisMaximaProbed;
 
 #if HAS_MASS_STORAGE
-	static bool WriteAxisLimits(FileStore *f, AxesBitmap axesProbed, const float limits[MaxAxes], int sParam);
+	static bool WriteAxisLimits(FileStore *f, AxesBitmap axesProbed, const float limits[MaxAxes], int sParam) noexcept;
 #endif
 
 	// Heaters
@@ -691,9 +730,9 @@ private:
 	Mutex auxMutex;
 #endif
 
-	OutputBuffer *auxGCodeReply;				// G-Code reply for AUX devices (special one because it is actually encapsulated before sending)
 	uint32_t auxSeq;							// Sequence number for AUX devices
-	bool auxDetected;							// Have we processed at least one G-Code from an AUX device?
+	bool auxEnabled;							// Do we have an AUX device?
+	bool auxRaw;								// true if aux device is in raw mode
 
 #ifdef SERIAL_AUX2_DEVICE
     volatile OutputStack aux2Output;
@@ -787,8 +826,11 @@ private:
 	Spindle spindles[MaxSpindles];
 	float extrusionAncilliaryPwmValue;
 	PwmPort extrusionAncilliaryPwmPort;
+
+#if SUPPORT_LASER
 	PwmPort laserPort;
 	float lastLaserPwm;
+#endif
 
 	// Power on/off
 	bool deferredPowerDown;
@@ -797,33 +839,23 @@ private:
 	bool deliberateError;								// true if we deliberately caused an exception for testing purposes
 };
 
-inline const char* Platform::GetConfigFile() const
-{
-	return CONFIG_FILE;
-}
-
 #if HAS_MASS_STORAGE
 
 // Where the htm etc files are
-inline const char* Platform::GetWebDir() const
+inline const char* Platform::GetWebDir() const noexcept
 {
 	return WEB_DIR;
 }
 
 // Where the gcodes are
-inline const char* Platform::GetGCodeDir() const
+inline const char* Platform::GetGCodeDir() const noexcept
 {
 	return GCODE_DIR;
 }
 
-inline const char* Platform::GetMacroDir() const
+inline const char* Platform::GetMacroDir() const noexcept
 {
 	return MACRO_DIR;
-}
-
-inline const char* Platform::GetDefaultFile() const
-{
-	return CONFIG_BACKUP_FILE;
 }
 
 #endif
@@ -832,57 +864,57 @@ inline const char* Platform::GetDefaultFile() const
 
 // Drive the RepRap machine - Movement
 
-inline float Platform::DriveStepsPerUnit(size_t drive) const
+inline float Platform::DriveStepsPerUnit(size_t drive) const noexcept
 {
 	return driveStepsPerUnit[drive];
 }
 
-inline float Platform::Acceleration(size_t drive) const
+inline float Platform::Acceleration(size_t drive) const noexcept
 {
 	return accelerations[drive];
 }
 
-inline const float* Platform::Accelerations() const
+inline const float* Platform::Accelerations() const noexcept
 {
 	return accelerations;
 }
 
-inline void Platform::SetAcceleration(size_t drive, float value)
+inline void Platform::SetAcceleration(size_t drive, float value) noexcept
 {
 	accelerations[drive] = max<float>(value, 1.0);		// don't allow zero or negative
 }
 
-inline float Platform::MaxFeedrate(size_t drive) const
+inline float Platform::MaxFeedrate(size_t drive) const noexcept
 {
 	return maxFeedrates[drive];
 }
 
-inline void Platform::SetMaxFeedrate(size_t drive, float value)
+inline void Platform::SetMaxFeedrate(size_t drive, float value) noexcept
 {
 	maxFeedrates[drive] = max<float>(value, minimumMovementSpeed);	// don't allow zero or negative, but do allow small values
 }
 
-inline float Platform::GetInstantDv(size_t drive) const
+inline float Platform::GetInstantDv(size_t drive) const noexcept
 {
 	return instantDvs[drive];
 }
 
-inline void Platform::SetInstantDv(size_t drive, float value)
+inline void Platform::SetInstantDv(size_t drive, float value) noexcept
 {
 	instantDvs[drive] = max<float>(value, 0.1);			// don't allow zero or negative values, they causes Move to loop indefinitely
 }
 
-inline void Platform::SetDirectionValue(size_t drive, bool dVal)
+inline void Platform::SetDirectionValue(size_t drive, bool dVal) noexcept
 {
 	directions[drive] = dVal;
 }
 
-inline bool Platform::GetDirectionValue(size_t drive) const
+inline bool Platform::GetDirectionValue(size_t drive) const noexcept
 {
 	return directions[drive];
 }
 
-inline void Platform::SetDriverDirection(uint8_t driver, bool direction)
+inline void Platform::SetDriverDirection(uint8_t driver, bool direction) noexcept
 {
 	if (driver < NumDirectDrivers)
 	{
@@ -891,22 +923,30 @@ inline void Platform::SetDriverDirection(uint8_t driver, bool direction)
 	}
 }
 
-inline int8_t Platform::GetEnableValue(size_t driver) const
+inline void Platform::SetDriverAbsoluteDirection(size_t driver, bool direction) noexcept
+{
+	if (driver < NumDirectDrivers)
+	{
+		digitalWrite(DIRECTION_PINS[driver], direction);
+	}
+}
+
+inline int8_t Platform::GetEnableValue(size_t driver) const noexcept
 {
 	return enableValues[driver];
 }
 
-inline float Platform::AxisMaximum(size_t axis) const
+inline float Platform::AxisMaximum(size_t axis) const noexcept
 {
 	return axisMaxima[axis];
 }
 
-inline float Platform::AxisMinimum(size_t axis) const
+inline float Platform::AxisMinimum(size_t axis) const noexcept
 {
 	return axisMinima[axis];
 }
 
-inline float Platform::AxisTotalLength(size_t axis) const
+inline float Platform::AxisTotalLength(size_t axis) const noexcept
 {
 	return axisMaxima[axis] - axisMinima[axis];
 }
@@ -915,7 +955,7 @@ inline float Platform::AxisTotalLength(size_t axis) const
 // DC 2015-03-21: To allow users to control the cooling fan via gcodes generated by slic3r etc.,
 // only turn the fan on/off if the extruder ancilliary PWM has been set nonzero.
 // Caution: this is often called from an ISR, or with interrupts disabled!
-inline void Platform::ExtrudeOn()
+inline void Platform::ExtrudeOn() noexcept
 {
 	if (extrusionAncilliaryPwmValue > 0.0)
 	{
@@ -926,7 +966,7 @@ inline void Platform::ExtrudeOn()
 // DC 2015-03-21: To allow users to control the cooling fan via gcodes generated by slic3r etc.,
 // only turn the fan on/off if the extruder ancilliary PWM has been set nonzero.
 // Caution: this is often called from an ISR, or with interrupts disabled!
-inline void Platform::ExtrudeOff()
+inline void Platform::ExtrudeOff() noexcept
 {
 	if (extrusionAncilliaryPwmValue > 0.0)
 	{
@@ -938,51 +978,44 @@ inline void Platform::ExtrudeOff()
 
 // Drive the RepRap machine - Heat and temperature
 
-inline IPAddress Platform::GetIPAddress() const
+inline IPAddress Platform::GetIPAddress() const noexcept
 {
 	return ipAddress;
 }
 
-inline IPAddress Platform::NetMask() const
+inline IPAddress Platform::NetMask() const noexcept
 {
 	return netMask;
 }
 
-inline IPAddress Platform::GateWay() const
+inline IPAddress Platform::GateWay() const noexcept
 {
 	return gateWay;
 }
 
-inline float Platform::GetPressureAdvance(size_t extruder) const
+inline float Platform::GetPressureAdvance(size_t extruder) const noexcept
 {
 	return (extruder < MaxExtruders) ? pressureAdvance[extruder] : 0.0;
 }
 
-inline float Platform::GetFilamentWidth() const
+inline float Platform::GetFilamentWidth() const noexcept
 {
 	return filamentWidth;
 }
 
-inline void Platform::SetFilamentWidth(float width)
+inline void Platform::SetFilamentWidth(float width) noexcept
 {
 	filamentWidth = width;
 }
 
-inline float Platform::GetNozzleDiameter() const
+inline float Platform::GetNozzleDiameter() const noexcept
 {
 	return nozzleDiameter;
 }
 
-inline void Platform::SetNozzleDiameter(float diameter)
+inline void Platform::SetNozzleDiameter(float diameter) noexcept
 {
 	nozzleDiameter = diameter;
-}
-
-inline OutputBuffer *Platform::GetAuxGCodeReply()
-{
-	OutputBuffer *temp = auxGCodeReply;
-	auxGCodeReply = nullptr;
-	return temp;
 }
 
 #endif

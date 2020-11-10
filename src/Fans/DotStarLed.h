@@ -15,8 +15,8 @@ class GCodeBuffer;
 
 namespace DotStarLed
 {
-	void Init();
-	GCodeResult SetColours(GCodeBuffer& gb, const StringRef& reply);
+	void Init() noexcept;
+	GCodeResult SetColours(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException);		// handle M150
 };
 
 #endif /* SRC_FANS_DOTSTARLED_H_ */

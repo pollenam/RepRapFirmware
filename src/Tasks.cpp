@@ -8,7 +8,6 @@
 #include "Tasks.h"
 #include "RepRap.h"
 #include "Platform.h"
-#include "Storage/CRC32.h"
 #include "Hardware/Cache.h"
 #include <TaskPriorities.h>
 
@@ -25,21 +24,24 @@ extern uint32_t _estack;				// defined in linker script
 
 // MAIN task data
 // The main task currently runs GCodes, so it needs to be large enough to hold the matrices used for delta auto calibration.
+// The worst case stack usage is after running delta auto calibration with Move debugging enabled.
 // The timer and idle tasks currently never do I/O, so they can be much smaller.
-#if defined(LPC_NETWORKING)
-constexpr unsigned int MainTaskStackWords = 1600-424;
+#if SAME70
+constexpr unsigned int MainTaskStackWords = 1800;			// on the SAME70 we use matrices of doubles
+#elif defined(__LPC17xx__)
+constexpr unsigned int MainTaskStackWords = 1110-(16*9);	// LPC builds only support 16 calibration points, so less space needed
 #else
-constexpr unsigned int MainTaskStackWords = 1600;
+constexpr unsigned int MainTaskStackWords = 1110;			// on other processors we use matrixes of floats
 #endif
 
 static Task<MainTaskStackWords> mainTask;
-extern "C" [[noreturn]] void MainTask(void * pvParameters);
+extern "C" [[noreturn]] void MainTask(void * pvParameters) noexcept;
 
 // Idle task data
-constexpr unsigned int IdleTaskStackWords = 60;
+constexpr unsigned int IdleTaskStackWords = 40;				// currently we don't use the idle talk for anything, so this can be quite small
 static Task<IdleTaskStackWords> idleTask;
 
-extern "C" void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize)
+extern "C" void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize) noexcept
 {
 	*ppxIdleTaskTCBBuffer = idleTask.GetTaskMemory();
 	*ppxIdleTaskStackBuffer = idleTask.GetStackBase();
@@ -52,7 +54,7 @@ extern "C" void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffe
 constexpr unsigned int TimerTaskStackWords = 60;
 static Task<TimerTaskStackWords> timerTask;
 
-extern "C" void vApplicationGetTimerTaskMemory(StaticTask_t **ppxTimerTaskTCBBuffer, StackType_t **ppxTimerTaskStackBuffer, uint32_t *pulTimerTaskStackSize)
+extern "C" void vApplicationGetTimerTaskMemory(StaticTask_t **ppxTimerTaskTCBBuffer, StackType_t **ppxTimerTaskStackBuffer, uint32_t *pulTimerTaskStackSize) noexcept
 {
     *ppxTimerTaskTCBBuffer = timerTask.GetTaskMemory();
     *ppxTimerTaskStackBuffer = timerTask.GetStackBase();
@@ -68,7 +70,7 @@ static Mutex sysDirMutex;
 static Mutex mallocMutex;
 
 // We need to make malloc/free thread safe. We must use a recursive mutex for it.
-extern "C" void __malloc_lock (struct _reent *_r)
+extern "C" void __malloc_lock (struct _reent *_r) noexcept
 {
 	if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)		// don't take mutex if scheduler not started or suspended
 	{
@@ -76,7 +78,7 @@ extern "C" void __malloc_lock (struct _reent *_r)
 	}
 }
 
-extern "C" void __malloc_unlock (struct _reent *_r)
+extern "C" void __malloc_unlock (struct _reent *_r) noexcept
 {
 	if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)		// don't release mutex if scheduler not started or suspended
 	{
@@ -85,10 +87,11 @@ extern "C" void __malloc_unlock (struct _reent *_r)
 }
 
 // Application entry point
-extern "C" [[noreturn]] void AppMain()
+extern "C" [[noreturn]] void AppMain() noexcept
 {
 	pinMode(DiagPin, OUTPUT_LOW);				// set up diag LED for debugging and turn it off
 
+#if !defined(DEBUG) && !defined(__LPC17xx__)	// don't check the CRC of a debug build because debugger breakpoints mess up the CRC
 	// Check the integrity of the firmware by checking the firmware CRC
 	{
 #ifdef IFLASH_ADDR
@@ -111,6 +114,7 @@ extern "C" [[noreturn]] void AppMain()
 			}
 		}
 	}
+#endif	// !defined(DEBUG) && !defined(__LPC17xx__)
 
 	// Fill the free memory with a pattern so that we can check for stack usage and memory corruption
 	char* heapend = sbrk(0);
@@ -127,14 +131,7 @@ extern "C" [[noreturn]] void AppMain()
 #if SAME70 && USE_MPU
 #endif
 
-#ifdef __LPC17xx__
-	// Setup LEDs, start off
-	pinMode(LED_PLAY, OUTPUT_LOW);
-	pinMode(LED1, OUTPUT_LOW);
-	pinMode(LED2, OUTPUT_LOW);
-	pinMode(LED3, OUTPUT_LOW);
-	pinMode(LED4, OUTPUT_LOW);
-#else
+#ifndef __LPC17xx__
 	// When doing a software reset, we disable the NRST input (User reset) to prevent the negative-going pulse that gets generated on it being held
 	// in the capacitor and changing the reset reason from Software to User. So enable it again here. We hope that the reset signal will have gone away by now.
 # ifndef RSTC_MR_KEY_PASSWD
@@ -165,7 +162,7 @@ extern "C" [[noreturn]] void AppMain()
 	for (;;) { }					// keep gcc happy
 }
 
-extern "C" [[noreturn]] void MainTask(void *pvParameters)
+extern "C" [[noreturn]] void MainTask(void *pvParameters) noexcept
 {
 	mallocMutex.Create("Malloc");
 	spiMutex.Create("SPI");
@@ -180,22 +177,12 @@ extern "C" [[noreturn]] void MainTask(void *pvParameters)
 }
 
 #ifdef __LPC17xx__
-	// These are defined in Linker Scripts for LPC
-	extern "C" unsigned int __AHB0_block_start;
-	extern "C" unsigned int __AHB0_dyn_start;
-	extern "C" unsigned int __AHB0_end;
-
-	extern "C" unsigned long __StackLimit;
-	extern "C" unsigned long __StackTop;
-
 	extern "C" size_t xPortGetTotalHeapSize( void );
-
-	volatile uint8_t sysTickLed = 0;
 #endif
 
 namespace Tasks
 {
-	static void GetHandlerStackUsage(uint32_t* maxStack, uint32_t* neverUsed)
+	static void GetHandlerStackUsage(uint32_t* maxStack, uint32_t* neverUsed) noexcept
 	{
 		const char * const ramend = (const char *)&_estack;
 		const char * const heapend = sbrk(0);
@@ -208,7 +195,7 @@ namespace Tasks
 		if (neverUsed != nullptr) { *neverUsed = stack_lwm - heapend; }
 	}
 
-	uint32_t GetNeverUsedRam()
+	uint32_t GetNeverUsedRam() noexcept
 	{
 		uint32_t neverUsedRam;
 
@@ -217,7 +204,7 @@ namespace Tasks
 	}
 
 	// Write data about the current task
-	void Diagnostics(MessageType mtype)
+	void Diagnostics(MessageType mtype) noexcept
 	{
 		Platform& p = reprap.GetPlatform();
 		p.Message(mtype, "=== RTOS ===\n");
@@ -237,52 +224,16 @@ namespace Tasks
 #endif
 			p.MessageF(mtype, "Static ram: %d\n", &_end - ramstart);
 
-			const struct mallinfo mi = mallinfo();
+#ifdef __LPC17xx__
+            p.MessageF(mtype, "Dynamic Memory (RTOS Heap 5): %d free, %d never used\n", xPortGetFreeHeapSize(), xPortGetMinimumEverFreeHeapSize() );
+#else
+            const struct mallinfo mi = mallinfo();
 			p.MessageF(mtype, "Dynamic ram: %d of which %d recycled\n", mi.uordblks, mi.fordblks);
-
+#endif
 			uint32_t maxStack, neverUsed;
 			GetHandlerStackUsage(&maxStack, &neverUsed);
 			p.MessageF(mtype, "Exception stack ram used: %" PRIu32 "\n", maxStack);
 			p.MessageF(mtype, "Never used ram: %" PRIu32 "\n", neverUsed);
-
-#ifdef __LPC17xx__
-			const uint32_t ahbStaticUsed = (uint32_t)&__AHB0_dyn_start -(uint32_t)&__AHB0_block_start;
-			const uint32_t totalMainUsage = (uint32_t)((&_end - ramstart) + mi.uordblks + maxStack);
-
-			p.MessageF(mtype, "AHB_RAM Static ram used : %" PRIu32 "\n", ahbStaticUsed);
-			p.Message(mtype, "=== Ram Totals ===\n");
-			p.MessageF(mtype, "Main SRAM         : %" PRIu32 "/%" PRIu32 " (%" PRIu32 " free, %" PRIu32 " never used)\n", totalMainUsage, (uint32_t)32*1024, 32*1024-totalMainUsage, neverUsed );
-			p.MessageF(mtype, "RTOS Dynamic Heap : %" PRIi32 "/%" PRIu32 " (%d free, %d never used)\n", (uint32_t)(xPortGetTotalHeapSize()-xPortGetFreeHeapSize()),(uint32_t)xPortGetTotalHeapSize(), xPortGetFreeHeapSize(),xPortGetMinimumEverFreeHeapSize() );
-
-			//Print out the PWM and timers freq
-			uint16_t freqs[4];
-			GetTimerInfo(freqs);
-			p.MessageF(mtype, "\n=== LPC PWM ===\n");
-			p.MessageF(mtype, "Hardware PWM: %d Hz\nPWMTimer1: %d Hz\nPWMTimer2: %d Hz\nPWMTimer3: %d Hz\n", freqs[0], freqs[1], freqs[2], freqs[3]);
-
-			//Print out our Special Pins Available:
-			p.MessageF(mtype, "\n=== GPIO Special Pins available === (i.e. with M42)\nLogicalPin - PhysicalPin\n");
-			for (size_t i=0; i<ARRAY_SIZE(SpecialPinMap); i++)
-			{
-				if (SpecialPinMap[i] != NoPin)
-				{
-					const uint8_t portNumber =  (SpecialPinMap[i]>>5);		// Divide the pin number by 32 go get the PORT number
-					const uint8_t pinNumber  =   SpecialPinMap[i] & 0x1f;	// lower 5-bits contains the bit number of a 32bit port
-
-					p.MessageF(mtype, " %d - P%d_%d ", (60+i), portNumber, pinNumber);
-					if (TimerPWMPinsArray[SpecialPinMap[i]])
-					{
-						const uint8_t tim = TimerPWMPinsArray[SpecialPinMap[i]] & 0x0F;
-						p.MessageF(mtype, "[Timer %s]", (tim&TimerPWM_1)?"1":(tim&TimerPWM_2)?"2":"3" );
-					}
-					else if ((g_APinDescription[SpecialPinMap[i]].ulPinAttribute & PIN_ATTR_PWM)==PIN_ATTR_PWM)
-					{
-						p.MessageF(mtype, "[HW PWM]");
-					}
-					p.MessageF(mtype, "\n");
-				}
-			}
-#endif //end __LPC17xx__
 
 		}	// end memory stats scope
 
@@ -312,17 +263,17 @@ namespace Tasks
 		p.MessageF(mtype, "\n");
 	}
 
-	const Mutex *GetSpiMutex()
+	const Mutex *GetSpiMutex() noexcept
 	{
 		return &spiMutex;
 	}
 
-	const Mutex *GetI2CMutex()
+	const Mutex *GetI2CMutex() noexcept
 	{
 		return &i2cMutex;
 	}
 
-	const Mutex *GetSysDirMutex()
+	const Mutex *GetSysDirMutex() noexcept
 	{
 		return &sysDirMutex;
 	}
@@ -332,33 +283,23 @@ namespace Tasks
 extern "C"
 {
 	// This intercepts the 1ms system tick
-	void vApplicationTickHook()
+	void vApplicationTickHook() noexcept
 	{
 		CoreSysTick();
 		reprap.Tick();
-
-#ifdef __LPC17xx__
-		//blink the PLAY_LED to indicate systick is running
-		sysTickLed++;						//uint8_t let it wrap around
-		if (sysTickLed == 255)
-		{
-			const bool state = GPIO_PinRead(LED_PLAY);
-			GPIO_PinWrite(LED_PLAY, !state);
-		}
-#endif
 	}
 
 	// Exception handlers
 	// By default the Usage Fault, Bus Fault and Memory Management fault handlers are not enabled,
 	// so they escalate to a Hard Fault and we don't need to provide separate exception handlers for them.
-	[[noreturn]] void hardFaultDispatcher(const uint32_t *pulFaultStackAddress)
+	[[noreturn]] void hardFaultDispatcher(const uint32_t *pulFaultStackAddress) noexcept
 	{
-	    reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::hardFault, pulFaultStackAddress + 5);
+	    reprap.SoftwareReset((uint16_t)SoftwareResetReason::hardFault, pulFaultStackAddress + 5);
 	}
 
 	// The fault handler implementation calls a function called hardFaultDispatcher()
-    void HardFault_Handler() __attribute__((naked, noreturn));
-	void HardFault_Handler()
+    void HardFault_Handler() noexcept __attribute__((naked, noreturn));
+	void HardFault_Handler() noexcept
 	{
 	    __asm volatile
 	    (
@@ -374,14 +315,14 @@ extern "C"
 
 #if USE_MPU
 
-	[[noreturn]] void memManageDispatcher(const uint32_t *pulFaultStackAddress)
+	[[noreturn]] void memManageDispatcher(const uint32_t *pulFaultStackAddress) noexcept
 	{
-	    reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::memFault, pulFaultStackAddress + 5);
+	    reprap.SoftwareReset((uint16_t)SoftwareResetReason::memFault, pulFaultStackAddress + 5);
 	}
 
-	// The fault handler implementation calls a function called hardFaultDispatcher()
-    void MemManage_Handler() __attribute__((naked, noreturn));
-	void MemManage_Handler()
+	// The fault handler implementation calls a function called memManageDispatcher()
+	[[noreturn]] void MemManage_Handler() noexcept __attribute__((naked));
+	void MemManage_Handler() noexcept
 	{
 	    __asm volatile
 	    (
@@ -397,19 +338,19 @@ extern "C"
 
 #endif
 
-	[[noreturn]] void wdtFaultDispatcher(const uint32_t *pulFaultStackAddress)
+	[[noreturn]] void wdtFaultDispatcher(const uint32_t *pulFaultStackAddress) noexcept
 	{
-	    reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::wdtFault, pulFaultStackAddress + 5);
+	    reprap.SoftwareReset((uint16_t)SoftwareResetReason::wdtFault, pulFaultStackAddress + 5);
 	}
 
 #ifdef __LPC17xx__
-    void WDT_IRQHandler() __attribute__((naked, noreturn));
-    void WDT_IRQHandler(void)
+	[[noreturn]] void WDT_IRQHandler() noexcept __attribute__((naked));
+    void WDT_IRQHandler() noexcept
     {
-    	LPC_WDT->WDMOD &=~((uint32_t)(1<<2)); //SD::clear timout flag before resetting to prevent the Smoothie bootloader going into DFU mode
+    	LPC_WDT->MOD &=~((uint32_t)(1<<2)); //SD::clear timout flag before resetting to prevent the Smoothie bootloader going into DFU mode
 #else
-    void WDT_Handler() __attribute__((naked, noreturn));
-	void WDT_Handler()
+    [[noreturn]] void WDT_Handler() noexcept __attribute__((naked));
+	void WDT_Handler() noexcept
 	{
 #endif
 	    __asm volatile
@@ -424,15 +365,15 @@ extern "C"
 	    );
 	}
 
-	[[noreturn]] void otherFaultDispatcher(const uint32_t *pulFaultStackAddress)
+	[[noreturn]] void otherFaultDispatcher(const uint32_t *pulFaultStackAddress) noexcept
 	{
-	    reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::otherFault, pulFaultStackAddress + 5);
+	    reprap.SoftwareReset((uint16_t)SoftwareResetReason::otherFault, pulFaultStackAddress + 5);
 	}
 
 	// 2017-05-25: A user is getting 'otherFault' reports, so now we do a stack dump for those too.
 	// The fault handler implementation calls a function called otherFaultDispatcher()
-	void OtherFault_Handler() __attribute__((naked, noreturn));
-	void OtherFault_Handler()
+	[[noreturn]] void OtherFault_Handler() noexcept __attribute__((naked));
+	void OtherFault_Handler() noexcept
 	{
 	    __asm volatile
 	    (
@@ -448,19 +389,19 @@ extern "C"
 
 	// We could set up the following fault handlers to retrieve the program counter in the same way as for a Hard Fault,
 	// however these exceptions are unlikely to occur, so for now we just report the exception type.
-	void NMI_Handler        () { reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::NMI); }
-	void UsageFault_Handler () { reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::usageFault); }
+	[[noreturn]] void NMI_Handler        () noexcept { reprap.SoftwareReset((uint16_t)SoftwareResetReason::NMI); }
+	[[noreturn]] void UsageFault_Handler () noexcept { reprap.SoftwareReset((uint16_t)SoftwareResetReason::usageFault); }
 
-	void DebugMon_Handler   () __attribute__ ((noreturn,alias("OtherFault_Handler")));
+	[[noreturn]] void DebugMon_Handler   () noexcept __attribute__ ((alias("OtherFault_Handler")));
 
 	// FreeRTOS hooks that we need to provide
-	[[noreturn]] void stackOverflowDispatcher(const uint32_t *pulFaultStackAddress, char* pcTaskName)
+	[[noreturn]] void stackOverflowDispatcher(const uint32_t *pulFaultStackAddress, char* pcTaskName) noexcept
 	{
-		reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::stackOverflow, pulFaultStackAddress);
+		reprap.SoftwareReset((uint16_t)SoftwareResetReason::stackOverflow, pulFaultStackAddress);
 	}
 
-	void vApplicationStackOverflowHook(TaskHandle_t pxTask, char *pcTaskName) __attribute((naked, noreturn));
-	void vApplicationStackOverflowHook(TaskHandle_t pxTask, char *pcTaskName)
+	[[noreturn]] void vApplicationStackOverflowHook(TaskHandle_t pxTask, char *pcTaskName) noexcept __attribute((naked));
+	void vApplicationStackOverflowHook(TaskHandle_t pxTask, char *pcTaskName) noexcept
 	{
 		// r0 = pxTask, r1 = pxTaskName
 		__asm volatile
@@ -473,13 +414,13 @@ extern "C"
 		);
 	}
 
-	[[noreturn]] void assertCalledDispatcher(const uint32_t *pulFaultStackAddress)
+	[[noreturn]] void assertCalledDispatcher(const uint32_t *pulFaultStackAddress) noexcept
 	{
-	    reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::assertCalled, pulFaultStackAddress);
+	    reprap.SoftwareReset((uint16_t)SoftwareResetReason::assertCalled, pulFaultStackAddress);
 	}
 
-	void vAssertCalled(uint32_t line, const char *file) __attribute((naked, noreturn));
-	void vAssertCalled(uint32_t line, const char *file)
+	[[noreturn]] void vAssertCalled(uint32_t line, const char *file) noexcept __attribute((naked));
+	void vAssertCalled(uint32_t line, const char *file) noexcept
 	{
 #if false
 		debugPrintf("ASSERTION FAILED IN %s on LINE %d\n", file, line);
@@ -496,13 +437,13 @@ extern "C"
 	}
 
 #ifdef __LPC17xx__
-	void applicationMallocFailedCalledDispatcher(const uint32_t *pulFaultStackAddress)
+	[[noreturn]] void applicationMallocFailedCalledDispatcher(const uint32_t *pulFaultStackAddress) noexcept
 	{
-		reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::assertCalled, pulFaultStackAddress);
+		reprap.SoftwareReset((uint16_t)SoftwareResetReason::assertCalled, pulFaultStackAddress);
 	}
 
-	void vApplicationMallocFailedHook( void ) __attribute((naked));
-	void vApplicationMallocFailedHook( void )
+	[[noreturn]] void vApplicationMallocFailedHook() noexcept __attribute((naked));
+	void vApplicationMallocFailedHook() noexcept
 	{
 		 __asm volatile
 		(
@@ -520,7 +461,37 @@ extern "C"
 namespace std
 {
 	// We need to define this function in order to use lambda functions with captures
-	void __throw_bad_function_call() { vAssertCalled(__LINE__, __FILE__); }
+	[[noreturn]] void __throw_bad_function_call() noexcept { vAssertCalled(__LINE__, __FILE__); }
 }
+
+// The default terminate handler pulls in sprintf and lots of other functions, which makes the binary too large. So we replace it.
+[[noreturn]] void Terminate() noexcept
+{
+	register const uint32_t * stack_ptr asm ("sp");
+	reprap.SoftwareReset((uint16_t)SoftwareResetReason::terminateCalled, stack_ptr);
+}
+
+namespace __cxxabiv1
+{
+	std::terminate_handler __terminate_handler = Terminate;
+}
+
+extern "C" [[noreturn]] void __cxa_pure_virtual() noexcept
+{
+	register const uint32_t * stack_ptr asm ("sp");
+	reprap.SoftwareReset((uint16_t)SoftwareResetReason::pureVirtual, stack_ptr);
+}
+
+extern "C" [[noreturn]] void __cxa_deleted_virtual() noexcept
+{
+	register const uint32_t * stack_ptr asm ("sp");
+	reprap.SoftwareReset((uint16_t)SoftwareResetReason::deletedVirtual, stack_ptr);
+}
+
+// We don't need the time zone functionality. Declaring these saves 8Kb.
+extern "C" void __tzset() noexcept { }
+extern "C" void __tz_lock() noexcept { }
+extern "C" void __tz_unlock() noexcept { }
+extern "C" void _tzset_unlocked() noexcept { }
 
 // End

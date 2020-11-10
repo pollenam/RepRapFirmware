@@ -11,30 +11,29 @@
 #include "RepRap.h"
 #include "Platform.h"
 
-LinearAnalogSensor::LinearAnalogSensor(unsigned int sensorNum)
+LinearAnalogSensor::LinearAnalogSensor(unsigned int sensorNum) noexcept
 	: SensorWithPort(sensorNum, "Linear analog"), lowTemp(DefaultLowTemp), highTemp(DefaultHighTemp), filtered(true), adcFilterChannel(-1)
 {
 	CalcDerivedParameters();
 }
 
-GCodeResult LinearAnalogSensor::Configure(GCodeBuffer& gb, const StringRef& reply)
+GCodeResult LinearAnalogSensor::Configure(GCodeBuffer& gb, const StringRef& reply, bool& changed)
 {
-	bool seen = false;
-	if (!ConfigurePort(gb, reply, PinAccess::readAnalog, seen))
+	if (!ConfigurePort(gb, reply, PinAccess::readAnalog, changed))
 	{
 		return GCodeResult::error;
 	}
 
-	gb.TryGetFValue('B', lowTemp, seen);
-	gb.TryGetFValue('C', highTemp, seen);
-	TryConfigureSensorName(gb, seen);
+	gb.TryGetFValue('B', lowTemp, changed);
+	gb.TryGetFValue('C', highTemp, changed);
+	TryConfigureSensorName(gb, changed);
 	if (gb.Seen('F'))
 	{
-		seen = true;
+		changed = true;
 		filtered = gb.GetIValue() >= 1;
 	}
 
-	if (seen)
+	if (changed)
 	{
 		CalcDerivedParameters();
 		if (adcFilterChannel >= 0)
@@ -50,7 +49,7 @@ GCodeResult LinearAnalogSensor::Configure(GCodeBuffer& gb, const StringRef& repl
 	return GCodeResult::ok;
 }
 
-void LinearAnalogSensor::Poll()
+void LinearAnalogSensor::Poll() noexcept
 {
 	if (filtered && adcFilterChannel >= 0)
 	{
@@ -71,7 +70,7 @@ void LinearAnalogSensor::Poll()
 	}
 }
 
-void LinearAnalogSensor::CalcDerivedParameters()
+void LinearAnalogSensor::CalcDerivedParameters() noexcept
 {
 	adcFilterChannel = reprap.GetPlatform().GetAveragingFilterIndex(port);
 	linearIncreasePerCount = (highTemp - lowTemp)/((filtered) ? FilteredAdcRange : UnfilteredAdcRange);

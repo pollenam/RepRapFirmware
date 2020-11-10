@@ -56,11 +56,8 @@
  * use lwIP facilities.
  * Uses Raw API only.
  */
-#ifndef LWIP_GMAC_TASK
-# error LWIP_GMAC_TASK must be defined in compiler settings
-#endif
 
-#define NO_SYS                		(!LWIP_GMAC_TASK)
+#define NO_SYS                		1
 
 /**
  * LWIP_NETIF_STATUS_CALLBACK==1: Support a callback function whenever an interface
@@ -136,7 +133,7 @@
  * MEMP_NUM_REASSDATA: the number of IP packets simultaneously queued for
  * reassembly (whole packets, not fragments!)
  */
-#define MEMP_NUM_REASSDATA              2
+#define MEMP_NUM_REASSDATA              5
 
 /**
  * MEMP_NUM_FRAG_PBUF: the number of IP fragments simultaneously sent
@@ -167,9 +164,9 @@
 #define MEMP_NUM_NETCONN                0
 
 /**
- * PBUF_POOL_SIZE: the number of buffers in the pbuf pool.
+ * PBUF_POOL_SIZE: the number of buffers in the pbuf pool. Needs to be enough for IP packet reassembly.
  */
-#define PBUF_POOL_SIZE                  (GMAC_RX_BUFFERS + 4)
+#define PBUF_POOL_SIZE                  (GMAC_RX_BUFFERS + GMAC_TX_BUFFERS + 12)
 
 /**
  * PBUF_POOL_BUFSIZE: the size of each pbuf in the pbuf pool.
@@ -195,7 +192,7 @@
 #define LWIP_NUM_NETIF_CLIENT_DATA  (LWIP_MDNS_RESPONDER)
 
 #if defined(__SAME70Q21__) || defined(__SAME70Q20B__) || defined(__SAME70Q21B__)
-extern uint32_t trueRandom(void);
+extern uint32_t trueRandom(void) noexcept;
 # define LWIP_RAND					trueRandom
 #else
 # define LWIP_RAND					random
@@ -268,6 +265,10 @@ extern uint32_t trueRandom(void);
  * field.
  */
 #define LWIP_NETIF_HOSTNAME             1
+
+/** The maximum number of services per netif */
+#define MDNS_MAX_SERVICES               4
+
 
 /*
    ------------------------------------

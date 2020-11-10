@@ -32,12 +32,12 @@ const char* const ErrorPagePart2 =
 	"</p>\n"
 	"</body>\n";
 
-HttpResponder::HttpResponder(NetworkResponder *n) : UploadingNetworkResponder(n)
+HttpResponder::HttpResponder(NetworkResponder *n) noexcept : UploadingNetworkResponder(n)
 {
 }
 
 // Ask the responder to accept this connection, returns true if it did
-bool HttpResponder::Accept(Socket *s, NetworkProtocol protocol)
+bool HttpResponder::Accept(Socket *s, NetworkProtocol protocol) noexcept
 {
 	if (responderState == ResponderState::free && protocol == HttpProtocol)
 	{
@@ -63,7 +63,7 @@ bool HttpResponder::Accept(Socket *s, NetworkProtocol protocol)
 }
 
 // Do some work, returning true if we did anything significant
-bool HttpResponder::Spin()
+bool HttpResponder::Spin() noexcept
 {
 	switch (responderState)
 	{
@@ -142,7 +142,7 @@ bool HttpResponder::Spin()
 //  of them in numHeaders.
 // If one of our arrays is about to overflow, or the message is not in a format we expect, then we call RejectMessage with an
 // appropriate error code and string.
-bool HttpResponder::CharFromClient(char c)
+bool HttpResponder::CharFromClient(char c) noexcept
 {
 	switch (parseState)
 	{
@@ -447,14 +447,15 @@ bool HttpResponder::CharFromClient(char c)
 // 'value' is null-terminated, but we also pass its length in case it contains embedded nulls, which matters when uploading files.
 // Return true if we generated a json response to send, false if we didn't and changed the state instead.
 // This may also return true with response == nullptr if we tried to generate a response but ran out of buffers.
-bool HttpResponder::GetJsonResponse(const char* request, OutputBuffer *&response, bool& keepOpen)
+bool HttpResponder::GetJsonResponse(const char* request, OutputBuffer *&response, bool& keepOpen) noexcept
 {
 	keepOpen = false;	// assume we don't want to persist the connection
-	if (StringEqualsIgnoreCase(request, "connect") && GetKeyValue("password") != nullptr)
+	const char *parameter;
+	if (StringEqualsIgnoreCase(request, "connect") && (parameter = GetKeyValue("password")) != nullptr)
 	{
 		if (!CheckAuthenticated())
 		{
-			if (!reprap.CheckPassword(GetKeyValue("password")))
+			if (!reprap.CheckPassword(parameter))
 			{
 				// Wrong password
 				response->copy("{\"err\":1}");
@@ -471,7 +472,8 @@ bool HttpResponder::GetJsonResponse(const char* request, OutputBuffer *&response
 		}
 
 		// Client has been logged in
-		response->printf("{\"err\":0,\"sessionTimeout\":%" PRIu32 ",\"boardType\":\"%s\"}", HttpSessionTimeout, GetPlatform().GetBoardString());
+		response->printf("{\"err\":0,\"sessionTimeout\":%" PRIu32 ",\"boardType\":\"%s\",\"apiLevel\":%u}",
+							HttpSessionTimeout, GetPlatform().GetBoardString(), ApiLevel);
 		reprap.GetPlatform().MessageF(LogMessage, "HTTP client %s login succeeded\n", IP4String(GetRemoteIP()).c_str());
 
 		// See if we can update the current RTC date and time
@@ -480,7 +482,7 @@ bool HttpResponder::GetJsonResponse(const char* request, OutputBuffer *&response
 		{
 			struct tm timeInfo;
 			memset(&timeInfo, 0, sizeof(timeInfo));
-			if (strptime(timeString, "%Y-%m-%dT%H:%M:%S", &timeInfo) != nullptr)
+			if (SafeStrptime(timeString, "%Y-%m-%dT%H:%M:%S", &timeInfo) != nullptr)
 			{
 				GetPlatform().SetDateTime(mktime(&timeInfo));
 			}
@@ -502,26 +504,31 @@ bool HttpResponder::GetJsonResponse(const char* request, OutputBuffer *&response
 		if (typeString != nullptr)
 		{
 			// New-style JSON status responses
-			int type = SafeStrtol(typeString);
+			int32_t type = StrToI32(typeString);
 			if (type < 1 || type > 3)
 			{
 				type = 1;
 			}
 
-			OutputBuffer::Release(response);
+			OutputBuffer::ReleaseAll(response);
 			response = reprap.GetStatusResponse(type, ResponseSource::HTTP);		// this may return nullptr
 		}
 		else
 		{
 			// Deprecated
-			OutputBuffer::Release(response);
+			OutputBuffer::ReleaseAll(response);
 			response = reprap.GetLegacyStatusResponse(1, 0);
 		}
 	}
-	else if (StringEqualsIgnoreCase(request, "gcode") && GetKeyValue("gcode") != nullptr)
+	else if (StringEqualsIgnoreCase(request, "gcode"))
 	{
+		const char *command = GetKeyValue("gcode");
 		NetworkGCodeInput * const httpInput = reprap.GetGCodes().GetHTTPInput();
-		httpInput->Put(HttpMessage, GetKeyValue("gcode"));
+		// If the command is empty, just report the buffer space. This allows rr_gcode to be used to poll the buffer space without using it up.
+		if (command != nullptr && command[0] != 0)
+		{
+			httpInput->Put(HttpMessage, command);
+		}
 		response->printf("{\"buff\":%u}", httpInput->BufferSpaceLeft());
 	}
 #if HAS_MASS_STORAGE
@@ -529,30 +536,30 @@ bool HttpResponder::GetJsonResponse(const char* request, OutputBuffer *&response
 	{
 		response->printf("{\"err\":%d}", (uploadError) ? 1 : 0);
 	}
-	else if (StringEqualsIgnoreCase(request, "delete") && GetKeyValue("name") != nullptr)
+	else if (StringEqualsIgnoreCase(request, "delete") && (parameter = GetKeyValue("name")) != nullptr)
 	{
-		const bool ok = GetPlatform().Delete(FS_PREFIX, GetKeyValue("name"));
+		const bool ok = MassStorage::Delete(parameter, false);
 		response->printf("{\"err\":%d}", (ok) ? 0 : 1);
 	}
-	else if (StringEqualsIgnoreCase(request, "filelist") && GetKeyValue("dir") != nullptr)
+	else if (StringEqualsIgnoreCase(request, "filelist") && (parameter = GetKeyValue("dir")) != nullptr)
 	{
-		OutputBuffer::Release(response);
+		OutputBuffer::ReleaseAll(response);
 		const char* const firstVal = GetKeyValue("first");
-		const unsigned int startAt = (firstVal == nullptr) ? 0 : (unsigned int)SafeStrtol(firstVal);
-		response = reprap.GetFilelistResponse(GetKeyValue("dir"), startAt);		// this may return nullptr
+		const unsigned int startAt = (firstVal == nullptr) ? 0 : StrToU32(firstVal);
+		response = reprap.GetFilelistResponse(parameter, startAt);		// this may return nullptr
 	}
 	else if (StringEqualsIgnoreCase(request, "files"))
 	{
-		OutputBuffer::Release(response);
+		OutputBuffer::ReleaseAll(response);
 		const char* dir = GetKeyValue("dir");
 		if (dir == nullptr)
 		{
 			dir = GetPlatform().GetGCodeDir();
 		}
 		const char* const firstVal = GetKeyValue("first");
-		const unsigned int startAt = (firstVal == nullptr) ? 0 : SafeStrtol(firstVal);
+		const unsigned int startAt = (firstVal == nullptr) ? 0 : StrToU32(firstVal);
 		const char* const flagDirsVal = GetKeyValue("flagDirs");
-		const bool flagDirs = flagDirsVal != nullptr && SafeStrtol(flagDirsVal) == 1;
+		const bool flagDirs = flagDirsVal != nullptr && StrToU32(flagDirsVal) == 1;
 		response = reprap.GetFilesResponse(dir, startAt, flagDirs);				// this may return nullptr
 	}
 	else if (StringEqualsIgnoreCase(request, "move"))
@@ -564,9 +571,9 @@ bool HttpResponder::GetJsonResponse(const char* request, OutputBuffer *&response
 		{
 			if (StringEqualsIgnoreCase(GetKeyValue("deleteexisting"), "yes") && MassStorage::FileExists(oldVal) && MassStorage::FileExists(newVal))
 			{
-				MassStorage::Delete(newVal);
+				MassStorage::Delete(newVal, false);
 			}
-			success = MassStorage::Rename(oldVal, newVal);
+			success = MassStorage::Rename(oldVal, newVal, false);
 		}
 		response->printf("{\"err\":%d}", (success) ? 0 : 1);
 	}
@@ -576,7 +583,7 @@ bool HttpResponder::GetJsonResponse(const char* request, OutputBuffer *&response
 		bool success = false;
 		if (dirVal != nullptr)
 		{
-			success = MassStorage::MakeDirectory(dirVal);
+			success = MassStorage::MakeDirectory(dirVal, false);
 		}
 		response->printf("{\"err\":%d}", (success) ? 0 : 1);
 	}
@@ -608,9 +615,18 @@ bool HttpResponder::GetJsonResponse(const char* request, OutputBuffer *&response
 		responderState = ResponderState::gettingFileInfo;
 		return false;
 	}
+#if SUPPORT_OBJECT_MODEL
+	else if (StringEqualsIgnoreCase(request, "model"))
+	{
+		OutputBuffer::ReleaseAll(response);
+		const char *const filterVal = GetKeyValue("key");
+		const char *const flagsVal = GetKeyValue("flags");
+		response = reprap.GetModelResponse(filterVal, flagsVal);
+	}
+#endif
 	else if (StringEqualsIgnoreCase(request, "config"))
 	{
-		OutputBuffer::Release(response);
+		OutputBuffer::ReleaseAll(response);
 		response = reprap.GetConfigResponse();
 	}
 	else
@@ -622,7 +638,7 @@ bool HttpResponder::GetJsonResponse(const char* request, OutputBuffer *&response
 	return true;
 }
 
-const char* HttpResponder::GetKeyValue(const char *key) const
+const char* HttpResponder::GetKeyValue(const char *key) const noexcept
 {
 	for (size_t i = 0; i < numQualKeys; ++i)
 	{
@@ -636,7 +652,7 @@ const char* HttpResponder::GetKeyValue(const char *key) const
 
 // Called to process a FileInfo request, which may take several calls
 // Return true if complete
-bool HttpResponder::SendFileInfo(bool quitEarly)
+bool HttpResponder::SendFileInfo(bool quitEarly) noexcept
 {
 	OutputBuffer *jsonResponse = nullptr;
 	bool gotFileInfo = reprap.GetFileInfoResponse(filenameBeingProcessed.c_str(), jsonResponse, quitEarly);
@@ -669,7 +685,7 @@ bool HttpResponder::SendFileInfo(bool quitEarly)
 }
 
 // Authenticate current IP and return true on success
-bool HttpResponder::Authenticate()
+bool HttpResponder::Authenticate() noexcept
 {
 	if (CheckAuthenticated())
 	{
@@ -688,7 +704,7 @@ bool HttpResponder::Authenticate()
 }
 
 // Check and update the authentication
-bool HttpResponder::CheckAuthenticated()
+bool HttpResponder::CheckAuthenticated() noexcept
 {
 	const IPAddress remoteIP = GetRemoteIP();
 	for (size_t i = 0; i < numSessions; i++)
@@ -702,7 +718,7 @@ bool HttpResponder::CheckAuthenticated()
 	return false;
 }
 
-bool HttpResponder::RemoveAuthentication()
+bool HttpResponder::RemoveAuthentication() noexcept
 {
 	const IPAddress remoteIP = skt->GetRemoteIP();
 	for (size_t i = numSessions; i != 0; )
@@ -727,7 +743,7 @@ bool HttpResponder::RemoveAuthentication()
 	return false;
 }
 
-void HttpResponder::SendFile(const char* nameOfFileToSend, bool isWebFile)
+void HttpResponder::SendFile(const char* nameOfFileToSend, bool isWebFile) noexcept
 {
 #if HAS_MASS_STORAGE
 	FileStore *fileToSend = nullptr;
@@ -746,40 +762,55 @@ void HttpResponder::SendFile(const char* nameOfFileToSend, bool isWebFile)
 			nameOfFileToSend = INDEX_PAGE_FILE;
 		}
 
-		for (;;)
+		if (isWebFile && strlen(nameOfFileToSend) > MaxExpectedWebDirFilenameLength)
 		{
-			// Try to open a gzipped version of the file first
-			if (!StringEndsWithIgnoreCase(nameOfFileToSend, ".gz") && strlen(nameOfFileToSend) + 3 <= MaxFilenameLength)
+			// We have been asked for a file with a very long name. Don't try to open it, because that may lead to MassStorage::CombineName generating an error message.
+			// Instead, report a possible virus attack from the sending IP address.
+			// Exception: it if is an OCSP request, just return 404.
+			if (!StringStartsWith(nameOfFileToSend, "/ocsp"))
 			{
-				String<MaxFilenameLength> nameBuf;
-				nameBuf.copy(nameOfFileToSend);
-				nameBuf.cat(".gz");
-				fileToSend = GetPlatform().OpenFile(GetPlatform().GetWebDir(), nameBuf.c_str(), OpenMode::read);
+				GetPlatform().MessageF(WarningMessage,
+										"IP %s requested file '%.20s...' from HTTP server, possibly a virus attack\n",
+										IP4String(GetRemoteIP()).c_str(), nameOfFileToSend);
+			}
+		}
+		else
+		{
+			for (;;)
+			{
+				// Try to open a gzipped version of the file first
+				if (!StringEndsWithIgnoreCase(nameOfFileToSend, ".gz") && strlen(nameOfFileToSend) + 3 <= MaxFilenameLength)
+				{
+					String<MaxFilenameLength> nameBuf;
+					nameBuf.copy(nameOfFileToSend);
+					nameBuf.cat(".gz");
+					fileToSend = GetPlatform().OpenFile(GetPlatform().GetWebDir(), nameBuf.c_str(), OpenMode::read);
+					if (fileToSend != nullptr)
+					{
+						zip = true;
+						break;
+					}
+				}
+
+				// That failed, so try to open the normal version of the file
+				fileToSend = GetPlatform().OpenFile(GetPlatform().GetWebDir(), nameOfFileToSend, OpenMode::read);
 				if (fileToSend != nullptr)
 				{
-					zip = true;
 					break;
 				}
-			}
 
-			// That failed, so try to open the normal version of the file
-			fileToSend = GetPlatform().OpenFile(GetPlatform().GetWebDir(), nameOfFileToSend, OpenMode::read);
-			if (fileToSend != nullptr)
-			{
-				break;
-			}
-
-			if (StringEqualsIgnoreCase(nameOfFileToSend, INDEX_PAGE_FILE))
-			{
-				nameOfFileToSend = OLD_INDEX_PAGE_FILE;			// the index file wasn't found, so try the old one
-			}
-			else if (!strchr(nameOfFileToSend, '.'))			// if we were asked to return a file without a '.' in the name, return the index page
-			{
-				nameOfFileToSend = INDEX_PAGE_FILE;
-			}
-			else
-			{
-				break;
+				if (StringEqualsIgnoreCase(nameOfFileToSend, INDEX_PAGE_FILE))
+				{
+					nameOfFileToSend = OLD_INDEX_PAGE_FILE;			// the index file wasn't found, so try the old one
+				}
+				else if (!strchr(nameOfFileToSend, '.'))			// if we were asked to return a file without a '.' in the name, return the index page
+				{
+					nameOfFileToSend = INDEX_PAGE_FILE;
+				}
+				else
+				{
+					break;
+				}
 			}
 		}
 
@@ -868,7 +899,7 @@ void HttpResponder::SendFile(const char* nameOfFileToSend, bool isWebFile)
 #endif
 }
 
-void HttpResponder::SendGCodeReply()
+void HttpResponder::SendGCodeReply() noexcept
 {
 	{
 		// Do we need to keep the G-Code reply for other clients?
@@ -919,7 +950,7 @@ void HttpResponder::SendGCodeReply()
 }
 
 // Send a JSON response to the current command. outBuf is non-null on entry.
-void HttpResponder::SendJsonResponse(const char* command)
+void HttpResponder::SendJsonResponse(const char* command) noexcept
 {
 	// Try to authorise the user automatically to retain compatibility with the old web interface
 	if (!CheckAuthenticated() && reprap.NoPasswordSet())
@@ -958,7 +989,7 @@ void HttpResponder::SendJsonResponse(const char* command)
 		if (!gotResponse)
 		{
 			// GetJsonResponse() changed the state instead of returning a response
-			OutputBuffer::Release(jsonResponse);
+			OutputBuffer::ReleaseAll(jsonResponse);
 			return;
 		}
 		if (jsonResponse != nullptr && jsonResponse->HadOverflow())
@@ -971,30 +1002,12 @@ void HttpResponder::SendJsonResponse(const char* command)
 	if (jsonResponse == nullptr)
 	{
 		// We ran out of buffers at some point.
-		// Unfortunately the protocol is prone to deadlocking, because if most output buffers are used up holding a GCode reply,
-		// there may be insufficient buffers left to compose the status response to tell DWC that it needs to fetch that GCode reply.
-		// Until we fix the protocol, the best we can do is time out and throw some GCode responses away.
-		if (millis() - startedProcessingRequestAt >= MaxBufferWaitTime)
-		{
-			{
-				// Looks like we've run out of buffers and waiting hasn't help, so release some of the responses that are waiting to go
-				MutexLocker lock(gcodeReplyMutex);
-				OutputBuffer *buf = gcodeReply.Pop();
-				if (buf != nullptr)
-				{
-					OutputBuffer::ReleaseAll(buf);
-					OutputBuffer::ReleaseAll(outBuf);
-					return;					// next time we try, hopefully there will be a spare buffer
-				}
-			}
+		// DC 2020-05-05: we no longer retry or discard responses if there are no buffers available, instead we return a 503 error immediately
+		ReportOutputBufferExhaustion(__FILE__, __LINE__);
 
-			// We've freed all the buffer we have
-			ReportOutputBufferExhaustion(__FILE__, __LINE__);
-
-			// We know that we have an output buffer, but it may be too short to send a long reply, so send a short one
-			outBuf->copy(serviceUnavailableResponse);
-			Commit(ResponderState::free, false);
-		}
+		// We know that we have an output buffer, but it may be too short to send a long reply, so send a short one
+		outBuf->copy(serviceUnavailableResponse);
+		Commit(ResponderState::free, false);
 		return;
 	}
 
@@ -1034,31 +1047,12 @@ void HttpResponder::SendJsonResponse(const char* command)
 	if (outBuf->HadOverflow())
 	{
 		// We ran out of buffers at some point.
-		// Unfortunately the protocol is prone to deadlocking, because if most output buffer are used up holding a GCode reply,
-		// there may be insufficient buffers left to compose the status response to tell DWC that it needs to fetch that GCode reply.
-		// Until we fix the protocol, the best we can do is time out and throw the GCode response away.
-		if (millis() - startedProcessingRequestAt >= MaxBufferWaitTime)
-		{
-			{
-				MutexLocker lock(gcodeReplyMutex);
-				OutputBuffer *buf = gcodeReply.Pop();
-				if (buf != nullptr)
-				{
-					OutputBuffer::ReleaseAll(buf);
-					OutputBuffer::ReleaseAll(outBuf);
-					return;
-				}
-			}
-			ReportOutputBufferExhaustion(__FILE__, __LINE__);
-			OutputBuffer::Truncate(outBuf, 999999);				// release all buffers except the first one
-			outBuf->copy(serviceUnavailableResponse);
-			Commit(ResponderState::free, false);
-		}
-		else
-		{
-			// We ran out of buffers. Release the buffers we have and return false. The caller will retry later.
-			OutputBuffer::ReleaseAll(outBuf);
-		}
+		// DC 2020-05-05: we no longer retry or discard responses if there are no buffers available, instead we return a 503 error immediately
+		ReportOutputBufferExhaustion(__FILE__, __LINE__);
+
+		// We know that we have an output buffer, but it may be too short to send a long reply, so send a short one
+		outBuf->copy(serviceUnavailableResponse);
+		Commit(ResponderState::free, false);
 		return;
 	}
 
@@ -1071,7 +1065,7 @@ void HttpResponder::SendJsonResponse(const char* command)
 }
 
 // Process the message received. We have reached the end of the headers.
-void HttpResponder::ProcessMessage()
+void HttpResponder::ProcessMessage() noexcept
 {
 	if (reprap.Debug(moduleWebserver))
 	{
@@ -1095,7 +1089,7 @@ void HttpResponder::ProcessMessage()
 }
 
 // Process the message received. We have reached the end of the headers.
-void HttpResponder::ProcessRequest()
+void HttpResponder::ProcessRequest() noexcept
 {
 	if (numCommandWords < 2)
 	{
@@ -1163,7 +1157,7 @@ void HttpResponder::ProcessRequest()
 					{
 						if (StringEqualsIgnoreCase(headers[i].key, "Content-Length"))
 						{
-							postFileLength = atoi(headers[i].value);
+							postFileLength = StrToU32(headers[i].value);
 							contentLengthFound = true;
 							break;
 						}
@@ -1198,7 +1192,7 @@ void HttpResponder::ProcessRequest()
 					{
 						struct tm timeInfo;
 						memset(&timeInfo, 0, sizeof(timeInfo));
-						if (strptime(lastModifiedString, "%Y-%m-%dT%H:%M:%S", &timeInfo) != nullptr)
+						if (SafeStrptime(lastModifiedString, "%Y-%m-%dT%H:%M:%S", &timeInfo) != nullptr)
 						{
 							fileLastModified  = mktime(&timeInfo);
 						}
@@ -1251,7 +1245,7 @@ void HttpResponder::ProcessRequest()
 }
 
 // Reject the current message
-void HttpResponder::RejectMessage(const char* response, unsigned int code)
+void HttpResponder::RejectMessage(const char* response, unsigned int code) noexcept
 {
 	if (reprap.Debug(moduleWebserver))
 	{
@@ -1278,7 +1272,7 @@ void HttpResponder::RejectMessage(const char* response, unsigned int code)
 
 // This function overrides the one in class NetworkResponder.
 // It tries to process a chunk of uploaded data and changes the state if finished.
-void HttpResponder::DoUpload()
+void HttpResponder::DoUpload() noexcept
 {
 	const uint8_t *buffer;
 	size_t len;
@@ -1329,7 +1323,7 @@ void HttpResponder::DoUpload()
 #endif
 
 // This is called to force termination if we implement the specified protocol
-void HttpResponder::Terminate(NetworkProtocol protocol, NetworkInterface *interface)
+void HttpResponder::Terminate(NetworkProtocol protocol, NetworkInterface *interface) noexcept
 {
 	if (responderState != ResponderState::free && (protocol == HttpProtocol || protocol == AnyProtocol) && skt != nullptr && skt->GetInterface() == interface)
 	{
@@ -1338,7 +1332,7 @@ void HttpResponder::Terminate(NetworkProtocol protocol, NetworkInterface *interf
 }
 
 // This overrides the version in class NetworkResponder
-void HttpResponder::CancelUpload()
+void HttpResponder::CancelUpload() noexcept
 {
 	if (skt != nullptr)
 	{
@@ -1356,7 +1350,7 @@ void HttpResponder::CancelUpload()
 }
 
 // This overrides the version in class NetworkResponder
-void HttpResponder::SendData()
+void HttpResponder::SendData() noexcept
 {
 	NetworkResponder::SendData();
 	if (responderState == ResponderState::reading)
@@ -1365,18 +1359,18 @@ void HttpResponder::SendData()
 	}
 }
 
-void HttpResponder::Diagnostics(MessageType mt) const
+void HttpResponder::Diagnostics(MessageType mt) const noexcept
 {
 	GetPlatform().MessageF(mt, " HTTP(%d)", (int)responderState);
 }
 
-/*static*/ void HttpResponder::InitStatic()
+/*static*/ void HttpResponder::InitStatic() noexcept
 {
 	gcodeReplyMutex.Create("HttpGCodeReply");
 }
 
 // This is called when we are shutting down the network or just this protocol. It may be called even if this protocol isn't enabled.
-/*static*/ void HttpResponder::Disable()
+/*static*/ void HttpResponder::Disable() noexcept
 {
 	MutexLocker lock(gcodeReplyMutex);
 
@@ -1386,7 +1380,7 @@ void HttpResponder::Diagnostics(MessageType mt) const
 }
 
 // This is called from the GCodes task to store a response, which is picked up by the Network task
-/*static*/ void HttpResponder::HandleGCodeReply(const char *reply)
+/*static*/ void HttpResponder::HandleGCodeReply(const char *reply) noexcept
 {
 	if (numSessions > 0)
 	{
@@ -1400,7 +1394,11 @@ void HttpResponder::Diagnostics(MessageType mt) const
 				// No more space available, stop here
 				return;
 			}
-			gcodeReply.Push(buffer);
+			if (!gcodeReply.Push(buffer))
+			{
+				// Can't push, so buffer was discarded. Don't append to it.
+				return;
+			}
 		}
 
 		buffer->cat(reply);
@@ -1409,7 +1407,7 @@ void HttpResponder::Diagnostics(MessageType mt) const
 	}
 }
 
-/*static*/ void HttpResponder::HandleGCodeReply(OutputBuffer *reply)
+/*static*/ void HttpResponder::HandleGCodeReply(OutputBuffer *reply) noexcept
 {
 	if (reply != nullptr)
 	{
@@ -1433,7 +1431,7 @@ void HttpResponder::Diagnostics(MessageType mt) const
 
 
 // Check for timed out sessions and old reply buffers
-/*static*/ void HttpResponder::CheckSessions()
+/*static*/ void HttpResponder::CheckSessions() noexcept
 {
 	unsigned int clientsTimedOut = 0;
 	const uint32_t now = millis();
@@ -1490,7 +1488,7 @@ void HttpResponder::Diagnostics(MessageType mt) const
 	}
 }
 
-/*static*/ void HttpResponder::CommonDiagnostics(MessageType mtype)
+/*static*/ void HttpResponder::CommonDiagnostics(MessageType mtype) noexcept
 {
 	GetPlatform().MessageF(mtype, "HTTP sessions: %u of %u\n", numSessions, MaxHttpSessions);
 }
@@ -1501,7 +1499,7 @@ HttpResponder::HttpSession HttpResponder::sessions[MaxHttpSessions];
 unsigned int HttpResponder::numSessions = 0;
 unsigned int HttpResponder::clientsServed = 0;
 
-volatile uint32_t HttpResponder::seq = 0;
+volatile uint16_t HttpResponder::seq = 0;
 volatile OutputStack HttpResponder::gcodeReply;
 Mutex HttpResponder::gcodeReplyMutex;
 

@@ -17,7 +17,7 @@
 //*************************************************************************************************
 // OutputBuffer class implementation
 
-void OutputBuffer::Append(OutputBuffer *other)
+void OutputBuffer::Append(OutputBuffer *other) noexcept
 {
 	if (other != nullptr)
 	{
@@ -35,7 +35,7 @@ void OutputBuffer::Append(OutputBuffer *other)
 	}
 }
 
-void OutputBuffer::IncreaseReferences(size_t refs)
+void OutputBuffer::IncreaseReferences(size_t refs) noexcept
 {
 	if (refs > 0)
 	{
@@ -49,7 +49,7 @@ void OutputBuffer::IncreaseReferences(size_t refs)
 	}
 }
 
-size_t OutputBuffer::Length() const
+size_t OutputBuffer::Length() const noexcept
 {
 	size_t totalLength = 0;
 	for (const OutputBuffer *current = this; current != nullptr; current = current->Next())
@@ -59,11 +59,11 @@ size_t OutputBuffer::Length() const
 	return totalLength;
 }
 
-char &OutputBuffer::operator[](size_t index)
+char &OutputBuffer::operator[](size_t index) noexcept
 {
 	// Get the right buffer to access
 	OutputBuffer *itemToIndex = this;
-	while (index > itemToIndex->DataLength())
+	while (index >= itemToIndex->DataLength())
 	{
 		index -= itemToIndex->DataLength();
 		itemToIndex = itemToIndex->Next();
@@ -73,11 +73,11 @@ char &OutputBuffer::operator[](size_t index)
 	return itemToIndex->data[index];
 }
 
-char OutputBuffer::operator[](size_t index) const
+char OutputBuffer::operator[](size_t index) const noexcept
 {
 	// Get the right buffer to access
 	const OutputBuffer *itemToIndex = this;
-	while (index > itemToIndex->DataLength())
+	while (index >= itemToIndex->DataLength())
 	{
 		index -= itemToIndex->DataLength();
 		itemToIndex = itemToIndex->Next();
@@ -87,14 +87,14 @@ char OutputBuffer::operator[](size_t index) const
 	return itemToIndex->data[index];
 }
 
-const char *OutputBuffer::Read(size_t len)
+const char *OutputBuffer::Read(size_t len) noexcept
 {
 	size_t offset = bytesRead;
 	bytesRead += len;
 	return data + offset;
 }
 
-size_t OutputBuffer::printf(const char *fmt, ...)
+size_t OutputBuffer::printf(const char *fmt, ...) noexcept
 {
 	char formatBuffer[FormatStringLength];
 	va_list vargs;
@@ -105,7 +105,7 @@ size_t OutputBuffer::printf(const char *fmt, ...)
 	return copy(formatBuffer);
 }
 
-size_t OutputBuffer::vprintf(const char *fmt, va_list vargs)
+size_t OutputBuffer::vprintf(const char *fmt, va_list vargs) noexcept
 {
 	char formatBuffer[FormatStringLength];
 	SafeVsnprintf(formatBuffer, ARRAY_SIZE(formatBuffer), fmt, vargs);
@@ -113,7 +113,7 @@ size_t OutputBuffer::vprintf(const char *fmt, va_list vargs)
 	return cat(formatBuffer);
 }
 
-size_t OutputBuffer::catf(const char *fmt, ...)
+size_t OutputBuffer::catf(const char *fmt, ...) noexcept
 {
 	char formatBuffer[FormatStringLength];
 	va_list vargs;
@@ -125,7 +125,19 @@ size_t OutputBuffer::catf(const char *fmt, ...)
 	return cat(formatBuffer);
 }
 
-size_t OutputBuffer::copy(const char c)
+size_t OutputBuffer::lcatf(const char *fmt, ...) noexcept
+{
+	char formatBuffer[FormatStringLength];
+	va_list vargs;
+	va_start(vargs, fmt);
+	SafeVsnprintf(formatBuffer, ARRAY_SIZE(formatBuffer), fmt, vargs);
+	va_end(vargs);
+
+	formatBuffer[ARRAY_UPB(formatBuffer)] = 0;
+	return lcat(formatBuffer);
+}
+
+size_t OutputBuffer::copy(const char c) noexcept
 {
 	// Unlink existing entries before starting the copy process
 	if (next != nullptr)
@@ -140,12 +152,12 @@ size_t OutputBuffer::copy(const char c)
 	return 1;
 }
 
-size_t OutputBuffer::copy(const char *src)
+size_t OutputBuffer::copy(const char *src) noexcept
 {
 	return copy(src, strlen(src));
 }
 
-size_t OutputBuffer::copy(const char *src, size_t len)
+size_t OutputBuffer::copy(const char *src, size_t len) noexcept
 {
 	// Unlink existing entries before starting the copy process
 	if (next != nullptr)
@@ -158,7 +170,7 @@ size_t OutputBuffer::copy(const char *src, size_t len)
 	return cat(src, len);
 }
 
-size_t OutputBuffer::cat(const char c)
+size_t OutputBuffer::cat(const char c) noexcept
 {
 	// See if we can append a char
 	if (last->dataLength == OUTPUT_BUFFER_SIZE)
@@ -189,12 +201,17 @@ size_t OutputBuffer::cat(const char c)
 	return 1;
 }
 
-size_t OutputBuffer::cat(const char *src)
+size_t OutputBuffer::cat(const char *src) noexcept
 {
 	return cat(src, strlen(src));
 }
 
-size_t OutputBuffer::cat(const char *src, size_t len)
+size_t OutputBuffer::lcat(const char *src) noexcept
+{
+	return lcat(src, strlen(src));
+}
+
+size_t OutputBuffer::cat(const char *src, size_t len) noexcept
 {
 	size_t copied = 0;
 	while (copied < len)
@@ -225,13 +242,22 @@ size_t OutputBuffer::cat(const char *src, size_t len)
 	return copied;
 }
 
-size_t OutputBuffer::cat(StringRef &str)
+size_t OutputBuffer::lcat(const char *src, size_t len) noexcept
+{
+	if (Length() != 0)
+	{
+		cat('\n');
+	}
+	return cat(src, len);
+}
+
+size_t OutputBuffer::cat(StringRef &str) noexcept
 {
 	return cat(str.c_str(), str.strlen());
 }
 
 // Encode a character in JSON format, and append it to the buffer and return the number of bytes written
-size_t OutputBuffer::EncodeChar(char c)
+size_t OutputBuffer::EncodeChar(char c) noexcept
 {
 	char esc;
 	switch (c)
@@ -271,7 +297,7 @@ size_t OutputBuffer::EncodeChar(char c)
 }
 
 // Encode a string in JSON format and append it to the buffer and return the number of bytes written
-size_t OutputBuffer::EncodeString(const char *src, bool allowControlChars, bool prependAsterisk)
+size_t OutputBuffer::EncodeString(const char *src, bool allowControlChars, bool prependAsterisk) noexcept
 {
 	size_t bytesWritten = cat('"');
 	if (prependAsterisk)
@@ -292,7 +318,7 @@ size_t OutputBuffer::EncodeString(const char *src, bool allowControlChars, bool 
 	return bytesWritten;
 }
 
-size_t OutputBuffer::EncodeReply(OutputBuffer *src)
+size_t OutputBuffer::EncodeReply(OutputBuffer *src) noexcept
 {
 	size_t bytesWritten = cat('"');
 
@@ -313,7 +339,7 @@ size_t OutputBuffer::EncodeReply(OutputBuffer *src)
 
 // Write all the data to file, but don't release the buffers
 // Returns true if successful
-bool OutputBuffer::WriteToFile(FileData& f) const
+bool OutputBuffer::WriteToFile(FileData& f) const noexcept
 {
 	bool endedInNewline = false;
 	const OutputBuffer *current = this;
@@ -340,7 +366,7 @@ bool OutputBuffer::WriteToFile(FileData& f) const
 #endif
 
 // Initialise the output buffers manager
-/*static*/ void OutputBuffer::Init()
+/*static*/ void OutputBuffer::Init() noexcept
 {
 	freeOutputBuffers = nullptr;
 	for (size_t i = 0; i < OUTPUT_BUFFER_COUNT; i++)
@@ -350,7 +376,7 @@ bool OutputBuffer::WriteToFile(FileData& f) const
 }
 
 // Allocates an output buffer instance which can be used for (large) string outputs. This must be thread safe. Not safe to call from interrupts!
-/*static*/ bool OutputBuffer::Allocate(OutputBuffer *&buf)
+/*static*/ bool OutputBuffer::Allocate(OutputBuffer *&buf) noexcept
 {
 	{
 		TaskCriticalSectionLocker lock;
@@ -372,6 +398,7 @@ bool OutputBuffer::WriteToFile(FileData& f) const
 			buf->references = 1;					// assume it's only used once by default
 			buf->isReferenced = false;
 			buf->hadOverflow = false;
+			buf->whenQueued = millis();				// use the time of allocation as the default when-used time
 
 			return true;
 		}
@@ -382,7 +409,7 @@ bool OutputBuffer::WriteToFile(FileData& f) const
 }
 
 // Get the number of bytes left for continuous writing
-/*static*/ size_t OutputBuffer::GetBytesLeft(const OutputBuffer *writingBuffer)
+/*static*/ size_t OutputBuffer::GetBytesLeft(const OutputBuffer *writingBuffer) noexcept
 {
 	const size_t freeOutputBuffers = OUTPUT_BUFFER_COUNT - usedOutputBuffers;
 	const size_t bytesLeft = OUTPUT_BUFFER_SIZE - writingBuffer->last->DataLength();
@@ -398,7 +425,7 @@ bool OutputBuffer::WriteToFile(FileData& f) const
 
 // Truncate an output buffer to free up more memory. Returns the number of released bytes.
 // This never releases the first buffer in the chain, so call it with a large value of bytesNeeded to release all buffers except the first.
-/*static */ size_t OutputBuffer::Truncate(OutputBuffer *buffer, size_t bytesNeeded)
+/*static */ size_t OutputBuffer::Truncate(OutputBuffer *buffer, size_t bytesNeeded) noexcept
 {
 	// Can we free up space from this chain? Don't break it up if it's referenced anywhere else
 	if (buffer == nullptr || buffer->Next() == nullptr || buffer->IsReferenced())
@@ -421,8 +448,7 @@ bool OutputBuffer::WriteToFile(FileData& f) const
 		}
 
 		// Unlink and free the last entry
-		previousItem->next = nullptr;
-		Release(lastItem);
+		ReleaseAll(previousItem->next);
 		releasedBytes += OUTPUT_BUFFER_SIZE;
 	} while (previousItem != buffer && releasedBytes < bytesNeeded);
 
@@ -435,7 +461,7 @@ bool OutputBuffer::WriteToFile(FileData& f) const
 }
 
 // Releases an output buffer instance and returns the next entry from the chain
-/*static */ OutputBuffer *OutputBuffer::Release(OutputBuffer *buf)
+/*static */ OutputBuffer *OutputBuffer::Release(OutputBuffer *buf) noexcept
 {
 	TaskCriticalSectionLocker lock;
 	OutputBuffer * const nextBuffer = buf->next;
@@ -456,7 +482,7 @@ bool OutputBuffer::WriteToFile(FileData& f) const
 	return nextBuffer;
 }
 
-/*static */ void OutputBuffer::ReleaseAll(OutputBuffer * volatile &buf)
+/*static */ void OutputBuffer::ReleaseAll(OutputBuffer * volatile &buf) noexcept
 {
 	while (buf != nullptr)
 	{
@@ -464,7 +490,7 @@ bool OutputBuffer::WriteToFile(FileData& f) const
 	}
 }
 
-/*static*/ void OutputBuffer::Diagnostics(MessageType mtype)
+/*static*/ void OutputBuffer::Diagnostics(MessageType mtype) noexcept
 {
 	reprap.GetPlatform().MessageF(mtype, "Used output buffers: %d of %d (%d max)\n",
 			usedOutputBuffers, OUTPUT_BUFFER_COUNT, maxUsedOutputBuffers);
@@ -473,8 +499,8 @@ bool OutputBuffer::WriteToFile(FileData& f) const
 //*************************************************************************************************
 // OutputStack class implementation
 
-// Push an OutputBuffer chain to the stack
-void OutputStack::Push(OutputBuffer *buffer, MessageType type) volatile
+// Push an OutputBuffer chain. Return true if successful, else release the buffer and return false.
+bool OutputStack::Push(OutputBuffer *buffer, MessageType type) volatile noexcept
 {
 	{
 		TaskCriticalSectionLocker lock;
@@ -488,15 +514,16 @@ void OutputStack::Push(OutputBuffer *buffer, MessageType type) volatile
 			items[count] = buffer;
 			types[count] = type;
 			count++;
-			return;
+			return true;
 		}
 	}
 	OutputBuffer::ReleaseAll(buffer);
 	reprap.GetPlatform().LogError(ErrorCode::OutputStackOverflow);
+	return false;
 }
 
 // Pop an OutputBuffer chain or return nullptr if none is available
-OutputBuffer *OutputStack::Pop() volatile
+OutputBuffer *OutputStack::Pop() volatile noexcept
 {
 	TaskCriticalSectionLocker lock;
 
@@ -517,13 +544,13 @@ OutputBuffer *OutputStack::Pop() volatile
 }
 
 // Returns the first item from the stack or nullptr if none is available
-OutputBuffer *OutputStack::GetFirstItem() const volatile
+OutputBuffer *OutputStack::GetFirstItem() const volatile noexcept
 {
 	return (count == 0) ? nullptr : items[0];
 }
 
 // Returns the first item's type from the stack or NoDestinationMessage if none is available
-MessageType OutputStack::GetFirstItemType() const volatile
+MessageType OutputStack::GetFirstItemType() const volatile noexcept
 {
 	return (count == 0) ? MessageType::NoDestinationMessage : types[0];
 }
@@ -531,7 +558,7 @@ MessageType OutputStack::GetFirstItemType() const volatile
 #if HAS_LINUX_INTERFACE
 
 // Update the first item of the stack
-void OutputStack::SetFirstItem(OutputBuffer *buffer) volatile
+void OutputStack::SetFirstItem(OutputBuffer *buffer) volatile noexcept
 {
 	if (count != 0)
 	{
@@ -550,7 +577,7 @@ void OutputStack::SetFirstItem(OutputBuffer *buffer) volatile
 #endif
 
 // Release the first item at the top of the stack
-void OutputStack::ReleaseFirstItem() volatile
+void OutputStack::ReleaseFirstItem() volatile noexcept
 {
 	if (count != 0)
 	{
@@ -566,40 +593,41 @@ void OutputStack::ReleaseFirstItem() volatile
 	}
 }
 
-// Release the first item on the top of the stack if it is too old. Return true if the item was timed out.
-bool OutputStack::ApplyTimeout(uint32_t ticks) volatile
+// Release the first item on the top of the stack if it is too old. Return true if the item was timed out or was null.
+bool OutputStack::ApplyTimeout(uint32_t ticks) volatile noexcept
 {
 	bool ret = false;
 	if (count != 0)
 	{
-		OutputBuffer * const buf = items[0];					// capture volatile variable
-		if (buf != nullptr && millis() - buf->whenQueued >= ticks)
+		OutputBuffer * buf = items[0];							// capture volatile variable
+		while (buf != nullptr && millis() - buf->whenQueued >= ticks)
 		{
-			items[0] = OutputBuffer::Release(buf);
+			items[0] = buf = OutputBuffer::Release(buf);
 			ret = true;
 		}
 		if (items[0] == nullptr)
 		{
 			(void)Pop();
+			ret = true;
 		}
 	}
 	return ret;
 }
 
 // Returns the last item from the stack or nullptr if none is available
-OutputBuffer *OutputStack::GetLastItem() const volatile
+OutputBuffer *OutputStack::GetLastItem() const volatile noexcept
 {
 	return (count == 0) ? nullptr : items[count - 1];
 }
 
 // Returns the type of the last item from the stack or NoDestinationMessage if none is available
-MessageType OutputStack::GetLastItemType() const volatile
+MessageType OutputStack::GetLastItemType() const volatile noexcept
 {
 	return (count == 0) ? MessageType::NoDestinationMessage : types[count - 1];
 }
 
 // Get the total length of all queued buffers
-size_t OutputStack::DataLength() const volatile
+size_t OutputStack::DataLength() const volatile noexcept
 {
 	size_t totalLength = 0;
 
@@ -617,7 +645,7 @@ size_t OutputStack::DataLength() const volatile
 
 // Append another OutputStack to this instance. If no more space is available,
 // all OutputBuffers that can't be added are automatically released
-void OutputStack::Append(volatile OutputStack& stack) volatile
+void OutputStack::Append(volatile OutputStack& stack) volatile noexcept
 {
 	for (size_t i = 0; i < stack.count; i++)
 	{
@@ -636,7 +664,7 @@ void OutputStack::Append(volatile OutputStack& stack) volatile
 }
 
 // Increase the number of references for each OutputBuffer on the stack
-void OutputStack::IncreaseReferences(size_t num) volatile
+void OutputStack::IncreaseReferences(size_t num) volatile noexcept
 {
 	TaskCriticalSectionLocker lock;
 	for (size_t i = 0; i < count; i++)
@@ -649,7 +677,7 @@ void OutputStack::IncreaseReferences(size_t num) volatile
 }
 
 // Release all buffers and clean up
-void OutputStack::ReleaseAll() volatile
+void OutputStack::ReleaseAll() volatile noexcept
 {
 	for (size_t i = 0; i < count; i++)
 	{

@@ -10,8 +10,9 @@
 
 #include "RTOSIface/RTOSIface.h"
 
+#include "GCodes/GCodeChannel.h"
 #include "GCodes/GCodeFileInfo.h"
-#include "MessageFormats.h"
+#include "LinuxMessageFormats.h"
 #include "MessageType.h"
 
 class Platform;
@@ -34,6 +35,7 @@ public:
 	void Init();
 	void Spin();
 	void Diagnostics(MessageType mtype);
+	bool IsConnected() const;
 
 	bool FillBuffer(GCodeBuffer &gb);		// Try to fill up the G-code buffer with the next available G-code
 
@@ -62,6 +64,7 @@ private:
 	char requestedFileChunk[MaxFileChunkSize];
 	int32_t requestedFileDataLength;
 
+	Mutex gcodeReplyMutex;
 	OutputStack *gcodeReply;
 	void HandleGCodeReply(MessageType type, const char *reply);		// accessed by Platform
 	void HandleGCodeReply(MessageType type, OutputBuffer *buffer);	// accessed by Platform

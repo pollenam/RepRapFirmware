@@ -15,7 +15,7 @@
 
 StepTimer * volatile StepTimer::pendingList = nullptr;
 
-void StepTimer::Init()
+void StepTimer::Init() noexcept
 {
 	// Timer interrupt for stepper motors
 	// The clock rate we use is a compromise. Too fast and the 64-bit square roots take a long time to execute. Too slow and we lose resolution.
@@ -25,19 +25,20 @@ void StepTimer::Init()
 	// On Duet 3 we need a step clock rate that can be programmed on SAME70, SAME5x and SAMC21 processors. We choose 750kHz (1.333us resolution)
 
 #ifdef __LPC17xx__
-	// LPC has 32bit timers
-	// Using the same 128 divisor (as also specified in DDA)
-	// LPC Timers default to /4 -->  (SystemCoreClock/4)
-	const uint32_t res = (VARIANT_MCK/128);						// 1.28us for 100MHz (LPC1768) and 1.067us for 120MHz (LPC1769)
+	//LPC has 32bit timers with 32bit prescalers
+	//Start a free running Timer using Match Registers to generate interrupts
 
-	// Start a free running Timer using Match Registers 0 and 1 to generate interrupts
-	LPC_SC->PCONP |= ((uint32_t) 1 << SBIT_PCTIM0);				// Ensure the Power bit is set for the Timer
-	STEP_TC->MCR = 0;											// disable all MRx interrupts
-	STEP_TC->PR   =  (getPclk(PCLK_TIMER0) / res) - 1;			// Set the LPC Prescaler (i.e. TC increment every 32 TimerClock Ticks)
-	STEP_TC->TC  = 0x00;  										// Restart the Timer Count
-	NVIC_SetPriority(STEP_TC_IRQN, NvicPriorityStep);			// set high priority for this IRQ; it's time-critical
+	// Setup the Prescaler such that every TC increment is equal to 1/StepClockRate
+	// The Prescale counter is incremented every Timer PCLK. When the Prescale counter reaches the value in PR+1, TC is then incremented
+	// Timer PCLK defaults to SystemCoreClock/4 on boot.
+	// Using a StepClockRate of 1MHz gives PR values of exactly 29 and 24 for the 1769 and 1786 respectively
+	Chip_Clock_EnablePeriphClock(SYSCTL_CLOCK_TIMER0);              // Enable power and clocking
+	STEP_TC->MCR = 0;											    // Disable all MRx interrupts
+	STEP_TC->PR = (getPclk(PCLK_TIMER0) / StepClockRate) - 1;	    // Set the Prescaler
+	STEP_TC->TC = 0x00;  										    // Restart the Timer Count
+	NVIC_SetPriority(STEP_TC_IRQN, NvicPriorityStep);			    // Set the priority for this IRQ
 	NVIC_EnableIRQ(STEP_TC_IRQN);
-	STEP_TC->TCR  = (1 << SBIT_CNTEN);							// Start Timer
+	STEP_TC->TCR = (1 <<SBIT_CNTEN);							    // Start Timer
 #else
 	pmc_set_writeprotect(false);
 	pmc_enable_periph_clk(STEP_TC_ID);
@@ -99,7 +100,7 @@ void StepTimer::Init()
 #if SAM4S || SAME70
 
 // Get the interrupt clock count. The TCs on the SAM4S and SAME70 are only 16 bits wide, so we maintain the upper 16 bits in a chained counter.
-/*static*/ uint32_t StepTimer::GetTimerTicks()
+/*static*/ uint32_t StepTimer::GetTimerTicks() noexcept
 {
 	uint16_t highWord = STEP_TC->TC_CHANNEL[STEP_TC_CHAN_UPPER].TC_CV;		// get the timer high word
 	do
@@ -118,7 +119,7 @@ void StepTimer::Init()
 
 // Schedule an interrupt at the specified clock count, or return true if that time is imminent or has passed already.
 // On entry, interrupts must be disabled or the base priority must be <= step interrupt priority.
-bool StepTimer::ScheduleTimerInterrupt(uint32_t tim)
+bool StepTimer::ScheduleTimerInterrupt(uint32_t tim) noexcept
 {
 	// We need to disable all interrupts, because once we read the current step clock we have only 6us to set up the interrupt, or we will miss it
 	const irqflags_t flags = cpu_irq_save();
@@ -130,79 +131,68 @@ bool StepTimer::ScheduleTimerInterrupt(uint32_t tim)
 	}
 
 #ifdef __LPC17xx__
-	STEP_TC->MR1 = tim; //set MR1 compare register
-	STEP_TC->MCR  |= (1<<SBIT_MR1I);     // Int on MR1 match
+	STEP_TC->MR[0] = tim;											// set MR0 compare register
+	STEP_TC->MCR |= (1u<<SBIT_MR0I);									// enable interrupt on MR0 match
 #else
 	STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_RB = tim;					// set up the compare register
 	(void)STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_SR;					// read the status register, which clears the status bits and any pending interrupt
 	STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_IER = TC_IER_CPBS;			// enable the interrupt
 #endif
 
-#ifdef SOFT_TIMER_DEBUG
-	lastSoftTimerInterruptScheduledAt = GetTimerTicksInterruptsDisabled();
-#endif
 	cpu_irq_restore(flags);
 	return false;
 }
 
 // Make sure we get no timer interrupts
-void StepTimer::DisableTimerInterrupt()
+void StepTimer::DisableTimerInterrupt() noexcept
 {
 #ifdef __LPC17xx__
-	STEP_TC->MCR  &= ~(1<<SBIT_MR1I);								 // disable Int on MR1
+	STEP_TC->MCR &= ~(1u<<SBIT_MR0I);								 // disable Int on MR1
 #else
 	STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_IDR = TC_IER_CPBS;
 #endif
 }
 
 // The guts of the ISR
-/*static*/ void StepTimer::Interrupt()
+/*static*/ void StepTimer::Interrupt() noexcept
 {
-	for (;;)
+	StepTimer * tmr = pendingList;
+	if (tmr != nullptr)
 	{
-		StepTimer * const tmr = pendingList;
-		if (tmr == nullptr)
+		for (;;)
 		{
-			return;
-		}
+			StepTimer * const nextTimer = tmr->next;
+			pendingList = nextTimer;								// remove it from the pending list
 
-		// On the first iteration, the timer at the head of the list is probably expired. But this isn't necessarily true, especially on platforms that use 16-bit timers.
-		// Try to schedule another interrupt for it, if we get a true return then it has indeed expired and we need to execute the callback.
-		// On subsequent iterations this just sets up the interrupt for the next timer that is due to expire.
-		if (!StepTimer::ScheduleTimerInterrupt(tmr->whenDue))
-		{
-			return;																		// interrupt isn't due yet and a new one has been scheduled
-		}
+			tmr->active = false;
+			tmr->callback(tmr->cbParam);							// execute its callback. This may schedule another callback and hence change the pending list.
 
-		pendingList = tmr->next;														// remove it from the pending list
-		tmr->active = false;
-		if (tmr->callback != nullptr && tmr->callback(tmr->cbParam, tmr->whenDue))		// execute its callback. This may schedule another callback and hence change the pending list.
-		{
-			// Schedule another callback for this timer
-			StepTimer** ppst = const_cast<StepTimer**>(&pendingList);
-			while (*ppst != nullptr && (int32_t)(tmr->whenDue - (*ppst)->whenDue) > 0)
+			tmr = pendingList;
+			if (tmr == nullptr || tmr != nextTimer)
 			{
-				ppst = &((*ppst)->next);
+				break;												// no more timers, or another timer has been inserted and an interrupt scheduled
 			}
-			tmr->next = *ppst;
-			*ppst = tmr;
-			tmr->active = true;
+
+			if (!StepTimer::ScheduleTimerInterrupt(tmr->whenDue))
+			{
+				break;												// interrupt isn't due yet and a new one has been scheduled
+			}
 		}
 	}
 }
 
 // Step pulse timer interrupt
-extern "C" void STEP_TC_HANDLER() __attribute__ ((hot));
+extern "C" void STEP_TC_HANDLER() noexcept __attribute__ ((hot));
 
-void STEP_TC_HANDLER()
+void STEP_TC_HANDLER() noexcept
 {
 #if defined(__LPC17xx__)
 	uint32_t regval = STEP_TC->IR;
 	//find which Match Register triggered the interrupt
-	if (regval & (1 << SBIT_MRI1_IFM)) //Interrupt flag for match channel 1.
+	if (regval & (1u << SBIT_MRI0_IFM))								// Interrupt flag for match channel 1.
 	{
-		STEP_TC->IR |= (1<<SBIT_MRI1_IFM); //clear interrupt
-		STEP_TC->MCR  &= ~(1<<SBIT_MR1I); //Disable Int on MR1
+		STEP_TC->IR |= (1u<<SBIT_MRI0_IFM);							// clear interrupt
+		STEP_TC->MCR  &= ~(1u<<SBIT_MR0I);							// Disable Int on MR0
 #else
 	// ATSAM processor code
 	uint32_t tcsr = STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_SR;		// read the status register, which clears the status bits
@@ -220,33 +210,52 @@ void STEP_TC_HANDLER()
 	}
 }
 
-StepTimer::StepTimer() : next(nullptr), callback(nullptr), active(false)
+StepTimer::StepTimer() noexcept : next(nullptr), callback(nullptr), active(false)
 {
 }
 
 // Set up the callback function and parameter
-void StepTimer::SetCallback(TimerCallbackFunction cb, CallbackParameter param)
+void StepTimer::SetCallback(TimerCallbackFunction cb, CallbackParameter param) noexcept
 {
 	callback = cb;
 	cbParam = param;
 }
 
 // Schedule a callback at a particular tick count, returning true if it was not scheduled because it is already due or imminent.
-bool StepTimer::ScheduleCallbackFromIsr(Ticks when)
+bool StepTimer::ScheduleCallbackFromIsr(Ticks when) noexcept
+{
+	whenDue = when;
+	return ScheduleCallbackFromIsr();
+}
+
+bool StepTimer::ScheduleCallbackFromIsr() noexcept
 {
 	if (active)
 	{
 		CancelCallbackFromIsr();
 	}
 
-	whenDue = when;
-	const Ticks now = GetTimerTicks();
-	const int32_t howSoon = (int32_t)(when - now);
-	StepTimer** ppst = const_cast<StepTimer**>(&pendingList);
-	if (*ppst == nullptr || howSoon < (int32_t)((*ppst)->whenDue - now))
+	// Optimise the common case i.e. no other timer is pending
+	if (pendingList == nullptr)
 	{
-		// No other callbacks are scheduled, or this one is due earlier than the first existing one
-		if (ScheduleTimerInterrupt(when))
+		if (ScheduleTimerInterrupt(whenDue))
+		{
+			return true;
+		}
+		next = nullptr;
+		pendingList = this;
+		active = true;
+		return false;
+	}
+
+	// Another timer is already pending
+	const Ticks now = GetTimerTicks();
+	const int32_t howSoon = (int32_t)(whenDue - now);
+	StepTimer** ppst = const_cast<StepTimer**>(&pendingList);
+	if (howSoon < (int32_t)((*ppst)->whenDue - now))
+	{
+		// This one is due earlier than the first existing one
+		if (ScheduleTimerInterrupt(whenDue))
 		{
 			return true;
 		}
@@ -265,7 +274,7 @@ bool StepTimer::ScheduleCallbackFromIsr(Ticks when)
 	return false;
 }
 
-bool StepTimer::ScheduleCallback(Ticks when)
+bool StepTimer::ScheduleCallback(Ticks when) noexcept
 {
 	const uint32_t baseprio = ChangeBasePriority(NvicPriorityStep);
 	const bool rslt = ScheduleCallbackFromIsr(when);
@@ -274,20 +283,20 @@ bool StepTimer::ScheduleCallback(Ticks when)
 }
 
 // Cancel any scheduled callback for this timer. Harmless if there is no callback scheduled.
-void StepTimer::CancelCallbackFromIsr()
+void StepTimer::CancelCallbackFromIsr() noexcept
 {
 	for (StepTimer** ppst = const_cast<StepTimer**>(&pendingList); *ppst != nullptr; ppst = &((*ppst)->next))
 	{
 		if (*ppst == this)
 		{
 			*ppst = this->next;		// unlink this from the pending list
-			active = false;
 			break;
 		}
 	}
+	active = false;
 }
 
-void StepTimer::CancelCallback()
+void StepTimer::CancelCallback() noexcept
 {
 	const uint32_t baseprio = ChangeBasePriority(NvicPriorityStep);
 	CancelCallbackFromIsr();

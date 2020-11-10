@@ -24,19 +24,43 @@
 # include "CAN/CanInterface.h"
 #endif
 
+#if SUPPORT_OBJECT_MODEL
+
+// Object model table and functions
+// Note: if using GCC version 7.3.1 20180622 and lambda functions are used in this table, you must compile this file with option -std=gnu++17.
+// Otherwise the table will be allocated in RAM instead of flash, which wastes too much RAM.
+
+// Macro to build a standard lambda function that includes the necessary type conversions
+#define OBJECT_MODEL_FUNC(...) OBJECT_MODEL_FUNC_BODY(TemperatureSensor, __VA_ARGS__)
+
+constexpr ObjectModelTableEntry TemperatureSensor::objectModelTable[] =
+{
+	// Within each group, these entries must be in alphabetical order
+	// 0. TemperatureSensor members
+	{ "lastReading",	OBJECT_MODEL_FUNC(self->lastTemperature, 1), 	ObjectModelEntryFlags::live },
+	{ "name",			OBJECT_MODEL_FUNC(self->sensorName), 			ObjectModelEntryFlags::none },
+	{ "type",			OBJECT_MODEL_FUNC(self->GetShortSensorType()), 	ObjectModelEntryFlags::none },
+};
+
+constexpr uint8_t TemperatureSensor::objectModelTableDescriptor[] = { 1, 3 };
+
+DEFINE_GET_OBJECT_MODEL_TABLE(TemperatureSensor)
+
+#endif
+
 // Constructor
-TemperatureSensor::TemperatureSensor(unsigned int sensorNum, const char *t)
+TemperatureSensor::TemperatureSensor(unsigned int sensorNum, const char *t) noexcept
 	: next(nullptr), sensorNumber(sensorNum), sensorType(t), sensorName(nullptr),
 	  lastTemperature(0.0), whenLastRead(0), lastResult(TemperatureError::notReady), lastRealError(TemperatureError::success) {}
 
 // Virtual destructor
-TemperatureSensor::~TemperatureSensor()
+TemperatureSensor::~TemperatureSensor() noexcept
 {
 	delete sensorName;
 }
 
 // Return the latest temperature reading
-TemperatureError TemperatureSensor::GetLatestTemperature(float& t, uint8_t outputNumber)
+TemperatureError TemperatureSensor::GetLatestTemperature(float& t, uint8_t outputNumber) noexcept
 {
 	if (millis() - whenLastRead > TemperatureReadingTimeout)
 	{
@@ -48,7 +72,7 @@ TemperatureError TemperatureSensor::GetLatestTemperature(float& t, uint8_t outpu
 }
 
 // Set the name - normally called only once, so we allow heap memory to be allocated
-void TemperatureSensor::SetSensorName(const char *newName)
+void TemperatureSensor::SetSensorName(const char *newName) noexcept
 {
 	// Change the heater name in a thread-safe manner
 	const char *oldName = sensorName;
@@ -64,11 +88,10 @@ void TemperatureSensor::SetSensorName(const char *newName)
 }
 
 // Default implementation of Configure, for sensors that have no configurable parameters
-GCodeResult TemperatureSensor::Configure(GCodeBuffer& gb, const StringRef& reply)
+GCodeResult TemperatureSensor::Configure(GCodeBuffer& gb, const StringRef& reply, bool& changed)
 {
-	bool seen = false;
-	TryConfigureSensorName(gb, seen);
-	if (!seen && !gb.Seen('Y'))
+	TryConfigureSensorName(gb, changed);
+	if (!changed && !gb.Seen('Y'))
 	{
 		// No parameters were provided, so report the current configuration
 		CopyBasicDetails(reply);
@@ -76,9 +99,9 @@ GCodeResult TemperatureSensor::Configure(GCodeBuffer& gb, const StringRef& reply
 	return GCodeResult::ok;
 }
 
-void TemperatureSensor::CopyBasicDetails(const StringRef& reply) const
+void TemperatureSensor::CopyBasicDetails(const StringRef& reply) const noexcept
 {
-	reply.printf("Sensor %d", sensorNumber);
+	reply.printf("Sensor %u", sensorNumber);
 	if (sensorName != nullptr)
 	{
 		reply.catf(" (%s)", sensorName);
@@ -99,7 +122,7 @@ void TemperatureSensor::TryConfigureSensorName(GCodeBuffer& gb, bool& seen)
 	}
 }
 
-void TemperatureSensor::SetResult(float t, TemperatureError rslt)
+void TemperatureSensor::SetResult(float t, TemperatureError rslt) noexcept
 {
 	lastResult = rslt;
 	lastTemperature = t;
@@ -111,7 +134,7 @@ void TemperatureSensor::SetResult(float t, TemperatureError rslt)
 }
 
 // This version is used for unsuccessful readings only
-void TemperatureSensor::SetResult(TemperatureError rslt)
+void TemperatureSensor::SetResult(TemperatureError rslt) noexcept
 {
 	lastResult = lastRealError = rslt;
 	lastTemperature = BadErrorTemperature;
@@ -121,13 +144,13 @@ void TemperatureSensor::SetResult(TemperatureError rslt)
 #if SUPPORT_CAN_EXPANSION
 
 // Get the expansion board address. Overridden for remote sensors.
-CanAddress TemperatureSensor::GetBoardAddress() const
+CanAddress TemperatureSensor::GetBoardAddress() const noexcept
 {
 	return CanInterface::GetCanAddress();
 }
 
 // Update the temperature, if it is a remote sensor. Overridden in class RemoteSensor.
-void TemperatureSensor::UpdateRemoteTemperature(CanAddress src, const CanSensorReport& report)
+void TemperatureSensor::UpdateRemoteTemperature(CanAddress src, const CanSensorReport& report) noexcept
 {
 	// Nothing to do here. This function is overridden in class RemoteSensor.
 }
@@ -136,9 +159,9 @@ void TemperatureSensor::UpdateRemoteTemperature(CanAddress src, const CanSensorR
 
 // Factory method
 #if SUPPORT_CAN_EXPANSION
-TemperatureSensor *TemperatureSensor::Create(unsigned int sensorNum, CanAddress boardAddress, const char *typeName, const StringRef& reply)
+TemperatureSensor *TemperatureSensor::Create(unsigned int sensorNum, CanAddress boardAddress, const char *typeName, const StringRef& reply) noexcept
 #else
-TemperatureSensor *TemperatureSensor::Create(unsigned int sensorNum, const char *typeName, const StringRef& reply)
+TemperatureSensor *TemperatureSensor::Create(unsigned int sensorNum, const char *typeName, const StringRef& reply) noexcept
 #endif
 {
 	TemperatureSensor *ts;
@@ -251,7 +274,7 @@ static const uint16_t tempTable[] =
 
 const size_t NumTempTableEntries = sizeof(tempTable)/sizeof(tempTable[0]);
 
-/*static*/ TemperatureError TemperatureSensor::GetPT100Temperature(float& t, uint16_t ohmsx100)
+/*static*/ TemperatureError TemperatureSensor::GetPT100Temperature(float& t, uint16_t ohmsx100) noexcept
 {
 
 	// Formally-verified binary search routine, adapted from one of the eCv examples

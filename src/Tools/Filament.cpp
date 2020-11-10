@@ -19,7 +19,7 @@ const char * const Filament::FilamentAssignmentFileComment = "RepRapFirmware fil
 Filament *Filament::filamentList = nullptr;
 
 
-Filament::Filament(int extr) : extruder(extr)
+Filament::Filament(int extr) noexcept : extruder(extr)
 {
 	strcpy(name, "");
 
@@ -27,21 +27,29 @@ Filament::Filament(int extr) : extruder(extr)
 	filamentList = this;
 }
 
-void Filament::Load(const char *filamentName)
+void Filament::Load(const char *filamentName) noexcept
 {
 	SafeStrncpy(name, filamentName, ARRAY_SIZE(name));
 	Filament::SaveAssignments();
 }
 
-void Filament::Unload()
+void Filament::Unload() noexcept
 {
 	strcpy(name, "");
 	Filament::SaveAssignments();
 }
 
-void Filament::LoadAssignment()
+void Filament::LoadAssignment() noexcept
 {
 #if HAS_MASS_STORAGE
+# if HAS_LINUX_INTERFACE
+	if (reprap.UsingLinuxInterface())
+	{
+		// Filament configuration is saved on the SBC
+		return;
+	}
+# endif
+
 	FileStore *file = reprap.GetPlatform().OpenSysFile(FilamentAssignmentFile, OpenMode::read);
 	if (file == nullptr)
 	{
@@ -56,7 +64,7 @@ void Filament::LoadAssignment()
 		{
 			while (file->ReadLine(buffer, sizeof(buffer)) > 0)
 			{
-				if (isdigit(buffer[0]) && atoi(buffer) == extruder)
+				if (isdigit(buffer[0]) && StrToI32(buffer) == extruder)
 				{
 					const char *filament = buffer;
 					while (*filament != 0)
@@ -78,9 +86,20 @@ void Filament::LoadAssignment()
 #endif
 }
 
-/*static*/ void Filament::SaveAssignments()
+/*static*/ void Filament::SaveAssignments() noexcept
 {
+	// Update the OM when the filament has been changed
+	reprap.MoveUpdated();
+
 #if HAS_MASS_STORAGE
+# if HAS_LINUX_INTERFACE
+	if (reprap.UsingLinuxInterface())
+	{
+		// Filament configuration is saved on the SBC
+		return;
+	}
+# endif
+
 	FileStore * const file = reprap.GetPlatform().OpenSysFile(FilamentAssignmentFile, OpenMode::write);
 	if (file == nullptr)
 	{
@@ -93,12 +112,11 @@ void Filament::LoadAssignment()
 
 	// Write header
 	buf.copy(FilamentAssignmentFileComment);
-	if (reprap.GetPlatform().IsDateTimeSet())
+	tm timeInfo;
+	if (reprap.GetPlatform().GetDateTime(timeInfo))
 	{
-		time_t timeNow = reprap.GetPlatform().GetDateTime();
-		const struct tm * const timeInfo = gmtime(&timeNow);
 		buf.catf(" generated at %04u-%02u-%02u %02u:%02u",
-						timeInfo->tm_year + 1900, timeInfo->tm_mon + 1, timeInfo->tm_mday, timeInfo->tm_hour, timeInfo->tm_min);
+						timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday, timeInfo.tm_hour, timeInfo.tm_min);
 	}
 	buf.cat('\n');
 	file->Write(buf.c_str());
@@ -118,7 +136,7 @@ void Filament::LoadAssignment()
 #endif
 }
 
-/*static*/ bool Filament::IsInUse(const char *filamentName)
+/*static*/ bool Filament::IsInUse(const char *filamentName) noexcept
 {
 	for (Filament *f = filamentList; f != nullptr; f = f->next)
 	{
@@ -130,7 +148,7 @@ void Filament::LoadAssignment()
 	return false;
 }
 
-/*static*/ Filament *Filament::GetFilamentByExtruder(const int drive)
+/*static*/ Filament *Filament::GetFilamentByExtruder(const int drive) noexcept
 {
 	for (Filament *f = filamentList; f != nullptr; f = f->next)
 	{

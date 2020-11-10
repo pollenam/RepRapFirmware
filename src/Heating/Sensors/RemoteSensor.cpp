@@ -14,24 +14,36 @@
 
 constexpr uint32_t RemoteTemperatureTimeoutMillis = 1000;
 
-RemoteSensor::RemoteSensor(unsigned int sensorNum, CanAddress pBoardAddress)
+RemoteSensor::RemoteSensor(unsigned int sensorNum, CanAddress pBoardAddress) noexcept
 	: TemperatureSensor(sensorNum, "remote"), boardAddress(pBoardAddress)
 {
 }
 
-GCodeResult RemoteSensor::Configure(GCodeBuffer& gb, const StringRef& reply)
+GCodeResult RemoteSensor::Configure(GCodeBuffer& gb, const StringRef& reply, bool& changed)
 {
-	bool seen = false;
-	TryConfigureSensorName(gb, seen);
+	TryConfigureSensorName(gb, changed);
 	CanMessageGenericConstructor cons(M308Params);
-	if (!cons.PopulateFromCommand(gb, reply))
+	cons.PopulateFromCommand(gb);
+	const GCodeResult ret = cons.SendAndGetResponse(CanMessageType::m308, boardAddress, reply);
+	if ((ret == GCodeResult::ok || ret == GCodeResult::warning) && StringStartsWith(reply.c_str(), "type "))
 	{
-		return GCodeResult::error;
+		// It's just a query for the sensor parameters, so prefix the sensor number and name
+		String<StringLength50> temp;
+		temp.printf("Sensor %u ", GetSensorNumber());
+		if (GetSensorName() != nullptr)
+		{
+			temp.catf("(%s) ", GetSensorName());
+		}
+		reply.Insert(0, temp.c_str());
 	}
-	return cons.SendAndGetResponse(CanMessageType::m308, boardAddress, reply);
+	else
+	{
+		changed = true;
+	}
+	return ret;
 }
 
-void RemoteSensor::UpdateRemoteTemperature(CanAddress src, const CanSensorReport& report)
+void RemoteSensor::UpdateRemoteTemperature(CanAddress src, const CanSensorReport& report) noexcept
 {
 	if (src == boardAddress)
 	{

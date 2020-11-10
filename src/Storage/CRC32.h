@@ -1,25 +1,22 @@
 #ifndef CRC32_H
 #define CRC32_H
 
-#include <cstdint> // for uint32_t
-#include <cstddef> // for size_t
+#include <RepRapFirmware.h>
 
 class CRC32
 {
 private:
-	static const uint32_t CRC_32_TAB[];
 	uint32_t crc;
 
 public:
-	CRC32();
-	void Update(char c);
-	void Update(const char *c, size_t len);
-	void Reset();
-	uint32_t Get() const;
-
+	CRC32() noexcept;
+	void Update(char c) noexcept;
+	void Update(const char *c, size_t len) noexcept;
+	void Reset() noexcept;
+	uint32_t Get() const noexcept;
 };
 
-inline uint32_t CRC32::Get() const
+inline uint32_t CRC32::Get() const noexcept
 {
 	return ~crc;
 }

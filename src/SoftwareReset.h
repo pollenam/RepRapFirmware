@@ -30,7 +30,10 @@ enum class SoftwareResetReason : uint16_t
 	stackOverflow = 8u << 5,		// FreeRTOS detected stack overflow
 	assertCalled = 9u << 5,			// FreeRTOS assertion failure
 	heaterWatchdog = 10u << 5,		// the Heat task didn't kick the watchdog often enough
-	memFault = 11u << 5,
+	memFault = 11u << 5,			// the MPU raised a fault
+	terminateCalled = 12u << 5,		// std::terminate was called
+	pureVirtual = 13u << 5,
+	deletedVirtual = 14u << 5,
 
 	mainReasonMask = 0x0F << 5,		// mask to pick out the  main reason in a uint16_t
 
@@ -38,7 +41,7 @@ enum class SoftwareResetReason : uint16_t
 	unusedBit = 0x0200,				// spare bit
 	unused2 = 0x0400,				// spare bit
 	inAuxOutput = 0x0800,			// this bit is or'ed in if we were in aux output at the time
-	inLwipSpin = 0x2000,			// we got stuck in a call to LWIP for too long
+	unused_was_inLwipSpin = 0x2000,	// no longer used
 	inUsbOutput = 0x4000,			// this bit is or'ed in if we were in USB output at the time
 	deliberate = 0x8000				// this but it or'ed in if we deliberately caused a fault
 };
@@ -67,12 +70,22 @@ struct SoftwareResetData
 	uint32_t taskName;							// first 4 bytes of the task name
 	uint32_t stack[23];							// stack when the exception occurred, with the program counter at the bottom
 
-	bool isVacant() const;						// return true if this struct can be written without erasing it first
-	void Populate(uint16_t reason, uint32_t time, const uint32_t *stk);
+	bool isVacant() const noexcept;				// return true if this struct can be written without erasing it first
+	void Populate(uint16_t reason, uint32_t time, const uint32_t *stk) noexcept;
 
 	static const uint16_t versionValue = 8;		// increment this whenever this struct changes
 	static const uint16_t magicValue = 0x7D00 | versionValue;	// value we use to recognise that all the flash data has been written
-	static const size_t numberOfSlots = 4;		// number of storage slots used to implement wear levelling - must fit in 512 bytes
+
+#ifdef __LPC17xx__
+	// Software Reset Data is stored in Flash. Since the LPC1768/9 doesn't have the page erase IAP command,
+	// so we have to use the whole sector (last sector of flash is used)
+	// The last sector size is 32k. IAP requires us to write at least 256 bytes and the destination address needs to be on a 256 byte boundary.
+	// Therefore can have 32k/256=128 slots and we will fill the entire sector before erasing it
+	static const size_t numberOfSlots = 128;    // number of storage slots used to implement wear levelling
+#else
+    static const size_t numberOfSlots = 4;		// number of storage slots used to implement wear levelling - must fit in 512 bytes
+#endif
+
 #if SAM3XA
 	static const uint32_t nvAddress = 0;		// must be 4-byte aligned
 #endif

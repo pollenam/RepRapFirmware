@@ -22,9 +22,9 @@ static size_t driversToStopIndexBeingFilled = 0;
 static size_t indexOfNextDriverToStop = 0;
 static volatile bool stopAllFlag = false;
 static bool doingStopAll = false;
-static LargeBitmap<CanId::MaxNormalAddress + 1> boardsActiveInLastMove;
+static LargeBitmap<CanId::MaxCanAddress + 1> boardsActiveInLastMove;
 
-void CanMotion::Init()
+void CanMotion::Init() noexcept
 {
 	movementBufferList = nullptr;
 	urgentMessageBuffer = CanMessageBuffer::Allocate();
@@ -32,7 +32,7 @@ void CanMotion::Init()
 }
 
 // This is called by DDA::Prepare at the start of preparing a movement
-void CanMotion::StartMovement(const DDA& dda)
+void CanMotion::StartMovement(const DDA& dda) noexcept
 {
 	// There shouldn't be any movement buffers in the list, but free any that there may be
 	for (;;)
@@ -49,7 +49,7 @@ void CanMotion::StartMovement(const DDA& dda)
 
 // This is called by DDA::Prepare for each active CAN DM in the move
 // If steps == 0 then the drivers just need to be enabled
-void CanMotion::AddMovement(const DDA& dda, const PrepParams& params, DriverId canDriver, int32_t steps, bool usePressureAdvance)
+void CanMotion::AddMovement(const DDA& dda, const PrepParams& params, DriverId canDriver, int32_t steps, bool usePressureAdvance) noexcept
 {
 	// Search for the correct movement buffer
 	CanMessageBuffer* buf = movementBufferList;
@@ -106,26 +106,26 @@ void CanMotion::AddMovement(const DDA& dda, const PrepParams& params, DriverId c
 }
 
 // This is called by DDA::Prepare when all DMs for CAN drives have been processed
-void CanMotion::FinishMovement(uint32_t moveStartTime)
+void CanMotion::FinishMovement(uint32_t moveStartTime) noexcept
 {
 	boardsActiveInLastMove.ClearAll();
 	CanMessageBuffer *buf;
 	while ((buf = movementBufferList) != nullptr)
 	{
-		boardsActiveInLastMove.SetBit(buf->id.Dst());
+		boardsActiveInLastMove.SetBit(buf->id.Dst());	//TODO should we set this if there were no steps for drives on the board, just drives to be enabled?
 		movementBufferList = buf->next;
 		buf->msg.move.whenToExecute = moveStartTime;
 		CanInterface::SendMotion(buf);				// queues the buffer for sending and frees it when done
 	}
 }
 
-bool CanMotion::CanPrepareMove()
+bool CanMotion::CanPrepareMove() noexcept
 {
 	return CanMessageBuffer::FreeBuffers() >= MaxCanBoards;
 }
 
 // This is called by the CanSender task to check if we have any urgent messages to send
-CanMessageBuffer *CanMotion::GetUrgentMessage()
+CanMessageBuffer *CanMotion::GetUrgentMessage() noexcept
 {
 	if (stopAllFlag)
 	{
@@ -160,12 +160,12 @@ CanMessageBuffer *CanMotion::GetUrgentMessage()
 
 	if (driversToStop[driversToStopIndexBeingFilled ^ 1].GetNumEntries() != 0)
 	{
-		uint16_t drivers;
+		CanDriversBitmap drivers;
 		const CanAddress board = driversToStop[driversToStopIndexBeingFilled ^ 1].GetNextBoardDriverBitmap(indexOfNextDriverToStop, drivers);
 		if (board != CanId::NoAddress)
 		{
 			auto msg = urgentMessageBuffer->SetupRequestMessage<CanMessageStopMovement>(0, CanInterface::GetCanAddress(), board);
-			msg->whichDrives = drivers;
+			msg->whichDrives = drivers.GetRaw();
 			return urgentMessageBuffer;
 		}
 		driversToStop[driversToStopIndexBeingFilled ^ 1].Clear();
@@ -177,23 +177,51 @@ CanMessageBuffer *CanMotion::GetUrgentMessage()
 
 // The next 4 functions may be called from the step ISR, so they can't send CAN messages directly
 
-void CanMotion::InsertHiccup(uint32_t numClocks)
+void CanMotion::InsertHiccup(uint32_t numClocks) noexcept
 {
 	hiccupToInsert += numClocks;
 	CanInterface::WakeCanSender();
 }
 
-void CanMotion::StopDriver(DriverId driver)
+void CanMotion::StopDriver(bool isBeingPrepared, DriverId driver) noexcept
 {
-	driversToStop[driversToStopIndexBeingFilled].AddEntry(driver);
-	CanInterface::WakeCanSender();
+	if (isBeingPrepared)
+	{
+		// Search for the correct movement buffer
+		CanMessageBuffer* buf = movementBufferList;
+		while (buf != nullptr && buf->id.Dst() != driver.boardAddress)
+		{
+			buf = buf->next;
+		}
+
+		if (buf != nullptr)
+		{
+			buf->msg.move.perDrive[driver.localDriver].steps = 0;
+		}
+	}
+	else
+	{
+		driversToStop[driversToStopIndexBeingFilled].AddEntry(driver);
+		CanInterface::WakeCanSender();
+	}
 }
 
-void CanMotion::StopAxis(size_t axis)
+void CanMotion::StopAxis(bool isBeingPrepared, size_t axis) noexcept
 {
-	if (!stopAllFlag)
+	const AxisDriversConfig& cfg = reprap.GetPlatform().GetAxisDriversConfig(axis);
+	if (isBeingPrepared)
 	{
-		const AxisDriversConfig& cfg = reprap.GetPlatform().GetAxisDriversConfig(axis);
+		for (size_t i = 0; i < cfg.numDrivers; ++i)
+		{
+			const DriverId driver = cfg.driverNumbers[i];
+			if (driver.IsRemote())
+			{
+				StopDriver(true, driver);
+			}
+		}
+	}
+	else if (!stopAllFlag)
+	{
 		for (size_t i = 0; i < cfg.numDrivers; ++i)
 		{
 			const DriverId driver = cfg.driverNumbers[i];
@@ -206,10 +234,25 @@ void CanMotion::StopAxis(size_t axis)
 	}
 }
 
-void CanMotion::StopAll()
+void CanMotion::StopAll(bool isBeingPrepared) noexcept
 {
-	stopAllFlag = true;
-	CanInterface::WakeCanSender();
+	if (isBeingPrepared)
+	{
+		// We still send the messages so that the drives get enabled, but we set the steps to zero
+		for (CanMessageBuffer *buf = movementBufferList; buf != nullptr; buf = buf->next)
+		{
+			buf->msg.move.accelerationClocks = buf->msg.move.decelClocks = buf->msg.move.steadyClocks = 0;
+			for (size_t drive = 0; drive < ARRAY_SIZE(buf->msg.move.perDrive); ++drive)
+			{
+				buf->msg.move.perDrive[drive].steps = 0;
+			}
+		}
+	}
+	else
+	{
+		stopAllFlag = true;
+		CanInterface::WakeCanSender();
+	}
 }
 
 #endif

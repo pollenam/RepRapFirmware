@@ -25,16 +25,16 @@ const char *const SoftwareResetData::ReasonText[] =
 	"Assertion failed",
 	"Heat task stuck",
 	"Memory protection fault",
-	"Unknown",
-	"Unknown",
-	"Unknown",
+	"Terminate called",
+	"Pure virtual function called",
+	"Deleted virtual function called",
 	"Unknown"
 };
 
 uint8_t SoftwareResetData::extraDebugInfo;			// extra info for debugging
 
 // Return true if this struct can be written without erasing it first
-bool SoftwareResetData::isVacant() const
+bool SoftwareResetData::isVacant() const noexcept
 {
 	const uint32_t *p = reinterpret_cast<const uint32_t*>(this);
 	for (size_t i = 0; i < sizeof(*this)/sizeof(uint32_t); ++i)
@@ -49,7 +49,7 @@ bool SoftwareResetData::isVacant() const
 }
 
 // Populate this reset data from the parameters passed and the CPU state
-void SoftwareResetData::Populate(uint16_t reason, uint32_t time, const uint32_t *stk)
+void SoftwareResetData::Populate(uint16_t reason, uint32_t time, const uint32_t *stk) noexcept
 {
 	magic = SoftwareResetData::magicValue;
 	resetReason = reason | ((extraDebugInfo & 0x07) << 5);

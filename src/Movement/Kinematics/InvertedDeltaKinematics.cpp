@@ -14,7 +14,7 @@ InvertedDeltaKinematics::InvertedDeltaKinematics(): maxPrintingHeight(300) {
 	// TODO Auto-generated constructor stub
 }
 
-void InvertedDeltaKinematics::Recalc()
+void InvertedDeltaKinematics::Recalc() noexcept
 {
 	LinearDeltaKinematics::Recalc();
 
@@ -59,7 +59,7 @@ bool InvertedDeltaKinematics::Configure(unsigned int mCode, GCodeBuffer& gb, con
 	return LinearDeltaKinematics::Configure(mCode, gb, reply, error);
 }
 
-bool InvertedDeltaKinematics::CartesianToMotorSteps(const float machinePos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, int32_t motorPos[], bool isCoordinated) const
+bool InvertedDeltaKinematics::CartesianToMotorSteps(const float machinePos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, int32_t motorPos[], bool isCoordinated) const noexcept
 {
 	float invertedMachinePos[MaxAxes];
 	for (size_t axis = 0; axis < numVisibleAxes; ++axis)
@@ -70,7 +70,7 @@ bool InvertedDeltaKinematics::CartesianToMotorSteps(const float machinePos[], co
 	return LinearDeltaKinematics::CartesianToMotorSteps(invertedMachinePos, stepsPerMm, numVisibleAxes, numTotalAxes, motorPos, isCoordinated);
 }
 
-void InvertedDeltaKinematics::MotorStepsToCartesian(const int32_t motorPos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, float machinePos[]) const
+void InvertedDeltaKinematics::MotorStepsToCartesian(const int32_t motorPos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, float machinePos[]) const noexcept
 {
 	LinearDeltaKinematics::MotorStepsToCartesian(motorPos, stepsPerMm, numVisibleAxes, numTotalAxes, machinePos);
 	machinePos[Z_AXIS] = -machinePos[Z_AXIS];

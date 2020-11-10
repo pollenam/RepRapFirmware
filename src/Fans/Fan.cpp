@@ -6,16 +6,51 @@
  */
 
 #include "Fan.h"
-#include "GCodes/GCodeBuffer/GCodeBuffer.h"
+#include <RepRap.h>
+#include <GCodes/GCodeBuffer/GCodeBuffer.h>
 
-Fan::Fan(unsigned int fanNum)
+#if SUPPORT_OBJECT_MODEL
+
+// Object model table and functions
+// Note: if using GCC version 7.3.1 20180622 and lambda functions are used in this table, you must compile this file with option -std=gnu++17.
+// Otherwise the table will be allocated in RAM instead of flash, which wastes too much RAM.
+
+// Macro to build a standard lambda function that includes the necessary type conversions
+#define OBJECT_MODEL_FUNC(...) OBJECT_MODEL_FUNC_BODY(Fan, __VA_ARGS__)
+#define OBJECT_MODEL_FUNC_IF(_condition,...) OBJECT_MODEL_FUNC_IF_BODY(Fan, _condition,__VA_ARGS__)
+
+constexpr ObjectModelTableEntry Fan::objectModelTable[] =
+{
+	// Within each group, these entries must be in alphabetical order
+	// 0. Fan members
+	{ "actualValue",		OBJECT_MODEL_FUNC(self->GetPwm(), 2), 															ObjectModelEntryFlags::live },
+	{ "blip",				OBJECT_MODEL_FUNC(0.001f * (float)self->blipTime, 2), 											ObjectModelEntryFlags::none },
+	// TODO add frequency here
+	{ "max",				OBJECT_MODEL_FUNC(self->maxVal, 2), 															ObjectModelEntryFlags::none },
+	{ "min",				OBJECT_MODEL_FUNC(self->minVal, 2), 															ObjectModelEntryFlags::none },
+	{ "name",				OBJECT_MODEL_FUNC(self->name.c_str()), 															ObjectModelEntryFlags::none },
+	{ "requestedValue",		OBJECT_MODEL_FUNC(self->val, 2), 																ObjectModelEntryFlags::live },
+	{ "rpm",				OBJECT_MODEL_FUNC(self->GetRPM()), 																ObjectModelEntryFlags::live },
+	{ "thermostatic",		OBJECT_MODEL_FUNC(self, 1), 																	ObjectModelEntryFlags::none },
+
+	// 1. Fan.thermostatic members
+	{ "heaters",			OBJECT_MODEL_FUNC(self->sensorsMonitored),														ObjectModelEntryFlags::none },	// empty if not thermostatic
+	{ "highTemperature",	OBJECT_MODEL_FUNC_IF(self->sensorsMonitored.IsNonEmpty(), self->triggerTemperatures[1], 1), 	ObjectModelEntryFlags::none },
+	{ "lowTemperature",		OBJECT_MODEL_FUNC_IF(self->sensorsMonitored.IsNonEmpty(), self->triggerTemperatures[0], 1), 	ObjectModelEntryFlags::none },
+};
+
+constexpr uint8_t Fan::objectModelTableDescriptor[] = { 2, 8, 3 };
+
+DEFINE_GET_OBJECT_MODEL_TABLE(Fan)
+
+#endif
+
+Fan::Fan(unsigned int fanNum) noexcept
 	: fanNumber(fanNum),
-	  val(0.0), lastVal(0.0),
+	  val(0.0),
 	  minVal(DefaultMinFanPwm),
 	  maxVal(1.0),										// 100% maximum fan speed
-	  blipTime(DefaultFanBlipTime),
-	  sensorsMonitored(0),
-	  isConfigured(false)
+	  blipTime(DefaultFanBlipTime)
 {
 	triggerTemperatures[0] = triggerTemperatures[1] = DefaultHotEndFanTemperature;
 }
@@ -57,42 +92,32 @@ bool Fan::Configure(unsigned int mcode, size_t fanNum, GCodeBuffer& gb, const St
 		if (gb.Seen('L'))		// Set minimum speed
 		{
 			seen = true;
-			float speed = gb.GetFValue();
-			if (speed > 1.0)
-			{
-				speed /= 255.0;
-			}
-			minVal = constrain<float>(speed, 0.0, maxVal);
+			minVal = min<float>(gb.GetPwmValue(), maxVal);
 		}
 
 		if (gb.Seen('X'))		// Set maximum speed
 		{
 			seen = true;
-			float speed = gb.GetFValue();
-			if (speed > 1.0)
-			{
-				speed /= 255.0;
-			}
-			maxVal = constrain<float>(speed, minVal, 1.0);
+			maxVal = max<float>(gb.GetPwmValue(), minVal);
 		}
 
 		if (gb.Seen('H'))		// Set thermostatically-controlled sensors
 		{
 			seen = true;
-			int32_t sensors[MaxSensorsInSystem];		// signed because we use H-1 to disable thermostatic mode
+			int32_t sensors[MaxSensors];			// signed because we use H-1 to disable thermostatic mode
 			size_t numH = ARRAY_SIZE(sensors);
 			gb.GetIntArray(sensors, numH, false);
 
 			// Note that M106 H-1 disables thermostatic mode. The following code implements that automatically.
-			sensorsMonitored = 0;
+			sensorsMonitored.Clear();
 			for (size_t h = 0; h < numH; ++h)
 			{
 				const int hnum = sensors[h];
 				if (hnum >= 0)
 				{
-					if (hnum < (int)MaxSensorsInSystem)
+					if (hnum < (int)MaxSensors)
 					{
-						SetBit(sensorsMonitored, (unsigned int)hnum);
+						sensorsMonitored.SetBit((unsigned int)hnum);
 					}
 					else
 					{
@@ -101,21 +126,20 @@ bool Fan::Configure(unsigned int mcode, size_t fanNum, GCodeBuffer& gb, const St
 					}
 				}
 			}
-			if (sensorsMonitored != 0)
+			if (sensorsMonitored.IsNonEmpty())
 			{
 				val = 1.0;					// default the fan speed to full for safety
 			}
 		}
 
-		if (gb.Seen('C') && gb.GetQuotedString(name.GetRef()))
+		if (gb.Seen('C'))
 		{
 			seen = true;
+			gb.GetQuotedString(name.GetRef());
 		}
 
 		if (seen)
 		{
-			isConfigured = true;
-
 			// We only act on the 'S' parameter here if we have processed other parameters
 			if (seen && gb.Seen('S'))		// Set new fan value - process this after processing 'H' or it may not be acted on
 			{
@@ -126,6 +150,7 @@ bool Fan::Configure(unsigned int mcode, size_t fanNum, GCodeBuffer& gb, const St
 			{
 				error = true;
 			}
+			reprap.FansUpdated();
 		}
 		else if (!gb.Seen('R') && !gb.Seen('S'))
 		{
@@ -141,17 +166,20 @@ bool Fan::Configure(unsigned int mcode, size_t fanNum, GCodeBuffer& gb, const St
 						(int)(maxVal * 100.0),
 						(double)(blipTime * MillisToSeconds)
 					  );
-			if (sensorsMonitored != 0)
+			if (sensorsMonitored.IsNonEmpty())
 			{
 				reply.catf(", temperature: %.1f:%.1fC, sensors:", (double)triggerTemperatures[0], (double)triggerTemperatures[1]);
-				for (unsigned int i = 0; i < MaxSensorsInSystem; ++i)
+				sensorsMonitored.Iterate([&reply](unsigned int sensorNum, unsigned int) noexcept { reply.catf(" %u", sensorNum); });
+				reply.cat(", current speed: ");
+				const float lastVal = GetPwm();
+				if (lastVal >= 0.0)
 				{
-					if (IsBitSet(sensorsMonitored, i))
-					{
-						reply.catf(" %u", i);
-					}
+					reply.catf("%d%%:", (int)(lastVal * 100.0));
 				}
-				reply.catf(", current speed: %d%%:", (int)(lastVal * 100.0));
+				else
+				{
+					reply.cat("unknown");
+				}
 			}
 		}
 	}
@@ -160,7 +188,7 @@ bool Fan::Configure(unsigned int mcode, size_t fanNum, GCodeBuffer& gb, const St
 }
 
 // Set the PWM. 'speed' is in the interval 0.0..1.0.
-GCodeResult Fan::SetPwm(float speed, const StringRef& reply)
+GCodeResult Fan::SetPwm(float speed, const StringRef& reply) noexcept
 {
 	val = speed;
 	return Refresh(reply);
@@ -169,9 +197,9 @@ GCodeResult Fan::SetPwm(float speed, const StringRef& reply)
 #if HAS_MASS_STORAGE
 
 // Save the settings of this fan if it isn't thermostatic
-bool Fan::WriteSettings(FileStore *f, size_t fanNum) const
+bool Fan::WriteSettings(FileStore *f, size_t fanNum) const noexcept
 {
-	if (sensorsMonitored == 0)
+	if (sensorsMonitored.IsNonEmpty())
 	{
 		String<StringLength20> fanCommand;
 		fanCommand.printf("M106 P%u S%.2f\n", fanNum, (double)val);
