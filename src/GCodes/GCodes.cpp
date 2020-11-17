@@ -1849,14 +1849,15 @@ bool GCodes::DoStraightMove(GCodeBuffer& gb, bool isCoordinated, const char *& e
 		if (gb.Seen(axisLetters[axis]))
 		{
 			// If it is a special move on a delta, movement must be relative.
-			if (moveBuffer.moveType != 0 && !gb.MachineState().axesRelative && reprap.GetMove().GetKinematics().GetKinematicsType() == KinematicsType::linearDelta)
+			if (moveBuffer.moveType != 0 && !gb.MachineState().axesRelative && (reprap.GetMove().GetKinematics().GetKinematicsType() == KinematicsType::linearDelta || reprap.GetMove().GetKinematics().GetKinematicsType() == KinematicsType::invertedLinearDelta))
 			{
 				err = "G0/G1: attempt to move individual motors of a delta machine to absolute positions";
 				return true;
 			}
 
 			axesMentioned.SetBit(axis);
-			const float moveArg = gb.GetDistance();
+			float moveArg = gb.GetDistance();
+
 			if (moveBuffer.moveType != 0)
 			{
 				// Special moves update the move buffer directly, bypassing the user coordinates
@@ -1878,6 +1879,10 @@ bool GCodes::DoStraightMove(GCodeBuffer& gb, bool isCoordinated, const char *& e
 			}
 			else if (gb.MachineState().axesRelative)
 			{
+				if(axis == Z_AXIS)
+				{
+					moveArg = -moveArg;
+				}
 				currentUserPosition[axis] += moveArg * (1.0 - moveFractionToSkip);
 			}
 			else if (gb.MachineState().g53Active)
@@ -1890,6 +1895,10 @@ bool GCodes::DoStraightMove(GCodeBuffer& gb, bool isCoordinated, const char *& e
 			}
 			else
 			{
+				if(axis == Z_AXIS)
+				{
+					moveArg = -moveArg;
+				}
 				currentUserPosition[axis] = moveArg + GetWorkplaceOffset(axis);
 			}
 		}

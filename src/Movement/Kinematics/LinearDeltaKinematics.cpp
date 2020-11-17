@@ -225,6 +225,16 @@ bool LinearDeltaKinematics::CartesianToMotorSteps(const float machinePos[], cons
 	{
 		motorPos[axis] = lrintf(machinePos[axis] * stepsPerMm[axis]);
 	}
+
+	if (reprap.Debug(moduleMove))
+	{
+		debugPrintf("CartesianToMotorSteps LinearDelta) :");
+		for (size_t i = 0; i < numVisibleAxes; ++i)
+		{
+			debugPrintf(" %.2f / %d", machinePos[i], motorPos[i]);
+		}
+		debugPrintf("\n");
+	}
 	return ok;
 }
 

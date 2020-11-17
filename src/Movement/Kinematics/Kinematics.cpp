@@ -9,6 +9,8 @@
 
 #include "CoreKinematics.h"
 #include "LinearDeltaKinematics.h"
+#include "InvertedDeltaKinematics.h"
+
 #include "RotaryDeltaKinematics.h"
 #include "ScaraKinematics.h"
 #include "HangprinterKinematics.h"
@@ -175,6 +177,8 @@ bool Kinematics::IsContinuousRotationAxis(size_t axis) const noexcept
 		return new RotaryDeltaKinematics();
 	case KinematicsType::fiveBarScara:
 		return new FiveBarScaraKinematics();
+	case KinematicsType::invertedLinearDelta:
+		return new InvertedDeltaKinematics();
 	}
 }
 
