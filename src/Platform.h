@@ -38,6 +38,7 @@ Licence: GPL
 #include "Endstops/EndstopsManager.h"
 #include <GPIO/GpInPort.h>
 #include <GPIO/GpOutPort.h>
+#include <Comms/AuxDevice.h>
 #include <General/IPAddress.h>
 
 #if defined(DUET_NG)
@@ -62,16 +63,17 @@ constexpr bool FORWARDS = true;
 constexpr bool BACKWARDS = !FORWARDS;
 
 // Define the number of ADC filters and the indices of the extra ones
+// Note, the thermistor code assumes that the first N filters are used by the TEMP0 to TEMP(N-1) thermistor inputs, where N = NumThermistorInputs
 #if HAS_VREF_MONITOR
 constexpr size_t VrefFilterIndex = NumThermistorInputs;
 constexpr size_t VssaFilterIndex = NumThermistorInputs + 1;
-# if HAS_CPU_TEMP_SENSOR
+# if HAS_CPU_TEMP_SENSOR && !SAME5x
 constexpr size_t CpuTempFilterIndex = NumThermistorInputs + 2;
 constexpr size_t NumAdcFilters = NumThermistorInputs + 3;
 # else
 constexpr size_t NumAdcFilters = NumThermistorInputs + 2;
 # endif
-#elif HAS_CPU_TEMP_SENSOR
+#elif HAS_CPU_TEMP_SENSOR && !SAME5x
 constexpr size_t CpuTempFilterIndex = NumThermistorInputs;
 constexpr size_t NumAdcFilters = NumThermistorInputs + 1;
 #else
@@ -96,7 +98,7 @@ constexpr unsigned int ZProbeAverageReadings = 8;		// We average this number of 
 // HEATERS - The bed is assumed to be the at index 0
 
 // Define the number of temperature readings we average for each thermistor. This should be a power of 2 and at least 4 ^ AD_OVERSAMPLE_BITS.
-#ifdef SAME70
+#if SAME70
 // On the SAME70 we read a thermistor on every tick so that we can average a higher number of readings
 // Keep THERMISTOR_AVERAGE_READINGS * NUM_HEATERS * 1ms no greater than HEAT_SAMPLE_TIME or the PIDs won't work well.
 constexpr unsigned int ThermistorAverageReadings = 16;
@@ -106,6 +108,10 @@ constexpr unsigned int ThermistorAverageReadings = 16;
 constexpr unsigned int ThermistorAverageReadings = 16;
 #endif
 
+#if SAME5x
+constexpr unsigned int TempSenseAverageReadings = 16;
+#endif
+
 constexpr uint32_t maxPidSpinDelay = 5000;			// Maximum elapsed time in milliseconds between successive temp samples by Pid::Spin() permitted for a temp sensor
 
 /****************************************************************************************************/
@@ -113,7 +119,11 @@ constexpr uint32_t maxPidSpinDelay = 5000;			// Maximum elapsed time in millisec
 enum class BoardType : uint8_t
 {
 	Auto = 0,
-#if defined(DUET3)
+#if defined(DUET3MINI)			// we use the same values for both v0.2 and v0.4
+	Duet3Mini_Unknown,
+	Duet3Mini_WiFi,
+	Duet3Mini_Ethernet,
+#elif defined(DUET3)
 	Duet3_v06_100 = 1,
 	Duet3_v101 = 2,
 #elif defined(SAME70XPLD)
@@ -122,7 +132,9 @@ enum class BoardType : uint8_t
 	DuetWiFi_10 = 1,
 	DuetWiFi_102 = 2,
 	DuetEthernet_10 = 3,
-	DuetEthernet_102 = 4
+	DuetEthernet_102 = 4,
+	Duet2SBC_10 = 5,
+	Duet2SBC_102 = 6,
 #elif defined(DUET_M)
 	DuetM_10 = 1,
 #elif defined(DUET_06_085)
@@ -135,11 +147,24 @@ enum class BoardType : uint8_t
 	PCCB_v10 = 1
 #elif defined(PCCB_08) || defined(PCCB_08_X5)
 	PCCB_v08 = 1
+#elif defined(DUET3MINI)
+	Duet_5LC = 1
 #elif defined(__LPC17xx__)
 	Lpc = 1
 #else
 # error Unknown board
 #endif
+};
+
+// Type of an axis. The values must correspond to values of the R parameter in the M584 command.
+enum class AxisWrapType : uint8_t
+{
+	noWrap = 0,						// axis does not wrap
+	wrapAt360,						// axis wraps, actual position are modulo 360deg
+#if 0	// shortcut axes not implemented yet
+	wrapWithShortcut,				// axis wraps, G0 moves are allowed to take the shortest direction
+#endif
+	undefined						// this one must be last
 };
 
 /***************************************************************************************************/
@@ -160,15 +185,20 @@ enum class DiagnosticTestType : unsigned int
 	PrintObjectAddresses = 106,		// print the addresses and sizes of various objects
 
 #ifdef __LPC17xx__
-    PrintBoardConfiguration = 200,    //Prints out all pin/values loaded from SDCard to configure board
+	PrintBoardConfiguration = 200,	// Prints out all pin/values loaded from SDCard to configure board
 #endif
+
+	SetWriteBuffer = 500,			// enable/disable the write buffer
+
+	OutputBufferStarvation = 900,	// Allocate almost all output buffers to emulate starvation
 
 	TestWatchdog = 1001,			// test that we get a watchdog reset if the tick interrupt stops
 	TestSpinLockup = 1002,			// test that we get a software reset if a Spin() function takes too long
 	TestSerialBlock = 1003,			// test what happens when we write a blocking message via debugPrintf()
 	DivideByZero = 1004,			// do an integer divide by zero to test exception handling
 	UnalignedMemoryAccess = 1005,	// do an unaligned memory access to test exception handling
-	BusFault = 1006					// generate a bus fault
+	BusFault = 1006,				// generate a bus fault
+	AccessMemory = 1007				// read or write  memory
 };
 
 /***************************************************************************************************************/
@@ -232,6 +262,9 @@ public:
 
 	static constexpr size_t NumAveraged() noexcept { return numAveraged; }
 
+	// Function used as an ADC callback to feed a result into an averaging filter
+	static void CallbackFeedIntoFilter(CallbackParameter cp, uint16_t val);
+
 private:
 	uint16_t readings[numAveraged];
 	size_t index;
@@ -241,8 +274,17 @@ private:
 	//invariant(index < numAveraged)
 };
 
+template<size_t numAveraged> void AveragingFilter<numAveraged>::CallbackFeedIntoFilter(CallbackParameter cp, uint16_t val)
+{
+	static_cast<AveragingFilter<numAveraged>*>(cp.vp)->ProcessReading(val);
+}
+
 typedef AveragingFilter<ThermistorAverageReadings> ThermistorAveragingFilter;
 typedef AveragingFilter<ZProbeAverageReadings> ZProbeAveragingFilter;
+
+#if SAME5x
+typedef AveragingFilter<TempSenseAverageReadings> TempSenseAveragingFilter;
+#endif
 
 // Enumeration of error condition bits
 enum class ErrorCode : uint32_t
@@ -284,7 +326,7 @@ public:
 
 	void Diagnostics(MessageType mtype) noexcept;
 	GCodeResult DiagnosticTest(GCodeBuffer& gb, const StringRef& reply, OutputBuffer*& buf, unsigned int d) THROWS(GCodeException);
-	bool WasDeliberateError() const noexcept { return deliberateError; }
+	static bool WasDeliberateError() noexcept { return deliberateError; }
 	void LogError(ErrorCode e) noexcept { errorCodeBits |= (uint32_t)e; }
 
 	bool AtxPower() const noexcept;
@@ -301,11 +343,14 @@ public:
 	size_t GetNumGpOutputsToReport() const noexcept;
 #endif
 
-#ifdef DUET_NG
+#if defined(DUET_NG) || defined(DUET3MINI)
 	bool IsDuetWiFi() const noexcept;
+#endif
+
+#ifdef DUET_NG
 	bool IsDueXPresent() const noexcept { return expansionBoard != ExpansionBoardType::none; }
-	const char *GetBoardName() const;
-	const char *GetBoardShortName() const;
+	const char *GetBoardName() const noexcept;
+	const char *GetBoardShortName() const noexcept;
 #endif
 
 	const MacAddress& GetDefaultMacAddress() const noexcept { return defaultMacAddress; }
@@ -322,14 +367,14 @@ public:
 
   	// Communications and data storage
 	void AppendUsbReply(OutputBuffer *buffer) noexcept;
-	void AppendAuxReply(OutputBuffer *buf, bool rawMessage) noexcept;
-	void AppendAuxReply(const char *msg, bool rawMessage) noexcept;
+	void AppendAuxReply(size_t auxNumber, OutputBuffer *buf, bool rawMessage) noexcept;
+	void AppendAuxReply(size_t auxNumber, const char *msg, bool rawMessage) noexcept;
 
-    bool IsAuxEnabled() const noexcept { return auxEnabled; }		// Any device on the AUX line?
-    void EnableAux() noexcept;
-    bool IsAuxRaw() const noexcept { return auxRaw; }
-	void SetAuxRaw(bool raw) noexcept { auxRaw = raw; }
 	void ResetChannel(size_t chan) noexcept;						// Re-initialise a serial channel
+    bool IsAuxEnabled(size_t auxNumber) const noexcept;				// Any device on the AUX line?
+    void EnableAux(size_t auxNumber) noexcept;
+    bool IsAuxRaw(size_t auxNumber) const noexcept;
+	void SetAuxRaw(size_t auxNumber, bool raw) noexcept;
 
 	void SetIPAddress(IPAddress ip) noexcept;
 	IPAddress GetIPAddress() const noexcept;
@@ -373,31 +418,30 @@ public:
 	void Message(MessageType type, OutputBuffer *buffer) noexcept;
 	void MessageF(MessageType type, const char *fmt, ...) noexcept __attribute__ ((format (printf, 3, 4)));
 	void MessageF(MessageType type, const char *fmt, va_list vargs) noexcept;
-	bool FlushAuxMessages() noexcept;
 	bool FlushMessages() noexcept;							// Flush messages to USB and aux, returning true if there is more to send
 	void SendAlert(MessageType mt, const char *message, const char *title, int sParam, float tParam, AxesBitmap controls) noexcept;
 	void StopLogging() noexcept;
 
 	// Movement
 	void EmergencyStop() noexcept;
+	size_t GetNumActualDirectDrivers() const noexcept;
 	void SetDirection(size_t axisOrExtruder, bool direction) noexcept;
 	void SetDirectionValue(size_t driver, bool dVal) noexcept;
 	bool GetDirectionValue(size_t driver) const noexcept;
 	void SetDriverAbsoluteDirection(size_t driver, bool dVal) noexcept;
 	void SetEnableValue(size_t driver, int8_t eVal) noexcept;
 	int8_t GetEnableValue(size_t driver) const noexcept;
-	void EnableLocalDrivers(size_t axisOrExtruder) noexcept;
+	void EnableDrivers(size_t axisOrExtruder) noexcept;
 	void EnableOneLocalDriver(size_t driver, float requiredCurrent) noexcept;
 	void DisableAllDrivers() noexcept;
 	void DisableDrivers(size_t axisOrExtruder) noexcept;
 	void DisableOneLocalDriver(size_t driver) noexcept;
 	void EmergencyDisableDrivers() noexcept;
 	void SetDriversIdle() noexcept;
-	bool SetMotorCurrent(size_t axisOrExtruder, float current, int code, const StringRef& reply) noexcept;
+	GCodeResult SetMotorCurrent(size_t axisOrExtruder, float current, int code, const StringRef& reply) noexcept;
 	float GetMotorCurrent(size_t axisOrExtruder, int code) const noexcept;
 	void SetIdleCurrentFactor(float f) noexcept;
-	float GetIdleCurrentFactor() const noexcept
-		{ return idleCurrentFactor; }
+	float GetIdleCurrentFactor() const noexcept { return idleCurrentFactor; }
 	bool SetDriverMicrostepping(size_t driver, unsigned int microsteps, int mode) noexcept;
 	bool SetMicrostepping(size_t axisOrExtruder, int microsteps, bool mode, const StringRef& reply) noexcept;
 	unsigned int GetMicrostepping(size_t axisOrExtruder, bool& interpolation) const noexcept;
@@ -423,7 +467,17 @@ public:
 	void SetAxisMinimum(size_t axis, float value, bool byProbing) noexcept;
 	float AxisTotalLength(size_t axis) const noexcept;
 	float GetPressureAdvance(size_t extruder) const noexcept;
-	GCodeResult SetPressureAdvance(float advance, GCodeBuffer& gb, const StringRef& reply);
+	GCodeResult SetPressureAdvance(float advance, GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException);
+
+	inline AxesBitmap GetLinearAxes() const noexcept { return linearAxes; }
+	inline AxesBitmap GetRotationalAxes() const noexcept { return rotationalAxes; }
+	inline bool IsAxisRotational(size_t axis) const noexcept { return rotationalAxes.IsBitSet(axis); }
+	inline bool IsAxisContinuous(size_t axis) const noexcept { return continuousAxes.IsBitSet(axis); }
+#if 0	// shortcut axes not implemented yet
+	inline bool IsAxisShortcutAllowed(size_t axis) const noexcept { return shortcutAxes.IsBitSet(axis); }
+#endif
+
+	void SetAxisType(size_t axis, AxisWrapType wrapType, bool isNistRotational) noexcept;
 
 	const AxisDriversConfig& GetAxisDriversConfig(size_t axis) const noexcept
 		pre(axis < MaxAxes)
@@ -457,7 +511,7 @@ public:
 	ReadLockedPointer<ZProbe> GetZProbeOrDefault(size_t probeNumber) noexcept { return endstops.GetZProbeOrDefault(probeNumber); }
 	void InitZProbeFilters() noexcept;
 	const volatile ZProbeAveragingFilter& GetZProbeOnFilter() const noexcept { return zProbeOnFilter; }
-	const volatile ZProbeAveragingFilter& GetZProbeOffFilter() const  noexcept{ return zProbeOffFilter; }
+	const volatile ZProbeAveragingFilter& GetZProbeOffFilter() const noexcept{ return zProbeOffFilter; }
 
 #if HAS_MASS_STORAGE
 	bool WritePlatformParameters(FileStore *f, bool includingG31) const noexcept;
@@ -475,8 +529,8 @@ public:
 	void UpdateConfiguredHeaters() noexcept;
 
 	// AUX device
-	void Beep(int freq, int ms) noexcept;
-	void SendAuxMessage(const char* msg) noexcept;
+	void PanelDueBeep(int freq, int ms) noexcept;
+	void SendPanelDueMessage(size_t auxNumber, const char* msg) noexcept;
 
 	// Hotend configuration
 	float GetFilamentWidth() const noexcept;
@@ -512,7 +566,7 @@ public:
 #endif
 
 #if HAS_SMART_DRIVERS
-	float GetTmcDriversTemperature(unsigned int board) const noexcept;
+	float GetTmcDriversTemperature(unsigned int boardNumber) const noexcept;
 	void DriverCoolingFansOnOff(DriverChannelsBitmap driverChannelsMonitored, bool on) noexcept;
 	unsigned int GetNumSmartDrivers() const noexcept { return numSmartDrivers; }
 #endif
@@ -531,6 +585,7 @@ public:
 	// Logging support
 	GCodeResult ConfigureLogging(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException);
 	const char *GetLogFileName() const noexcept;
+	const char *GetLogLevel() const noexcept;
 #endif
 
 	// Ancillary PWM
@@ -556,13 +611,18 @@ public:
 	const GpInputPort& GetGpInPort(size_t gpinPortNumber) const noexcept
 		pre(gpinPortNumber < MaxGpInPorts) 	{ return gpinPorts[gpinPortNumber]; }
 
-#if SUPPORTS_UNIQUE_ID
+#if MCU_HAS_UNIQUE_ID
 	uint32_t Random() noexcept;
 	const char *GetUniqueIdString() const noexcept { return uniqueIdChars; }
 #endif
 
 #if SUPPORT_CAN_EXPANSION
 	void HandleRemoteGpInChange(CanAddress src, uint8_t handleMajor, uint8_t handleMinor, bool state) noexcept;
+	GCodeResult UpdateRemoteStepsPerMmAndMicrostepping(AxesBitmap axesAndExtruders, const StringRef& reply) noexcept;
+#endif
+
+#if VARIABLE_NUM_DRIVERS
+	void AdjustNumDrivers(size_t numDriversNotAvailable) noexcept;
 #endif
 
 protected:
@@ -575,11 +635,12 @@ private:
 
 	void RawMessage(MessageType type, const char *message) noexcept;	// called by Message after handling error/warning flags
 
-	float AdcReadingToCpuTemperature(uint32_t reading) const noexcept;
+	float GetCpuTemperature() const noexcept;
 
 #if SUPPORT_CAN_EXPANSION
 	void IterateDrivers(size_t axisOrExtruder, std::function<void(uint8_t) /*noexcept*/ > localFunc, std::function<void(DriverId) /*noexcept*/ > remoteFunc) noexcept;
-	void IterateLocalDrivers(size_t axisOrExtruder, std::function<void(uint8_t) /*noexcept*/ > func) noexcept { IterateDrivers(axisOrExtruder, func, [](DriverId){}); }
+	void IterateLocalDrivers(size_t axisOrExtruder, std::function<void(uint8_t) /*noexcept*/ > func) noexcept { IterateDrivers(axisOrExtruder, func, [](DriverId) noexcept {}); }
+	void IterateRemoteDrivers(size_t axisOrExtruder, std::function<void(DriverId) /*noexcept*/ > func) noexcept { IterateDrivers(axisOrExtruder, [](uint8_t) noexcept {}, func); }
 #else
 	void IterateDrivers(size_t axisOrExtruder, std::function<void(uint8_t) /*noexcept*/ > localFunc) noexcept;
 	void IterateLocalDrivers(size_t axisOrExtruder, std::function<void(uint8_t) /*noexcept*/ > func) noexcept { IterateDrivers(axisOrExtruder, func); }
@@ -601,7 +662,8 @@ private:
 	MacAddress defaultMacAddress;
 
 	// Board and processor
-#if SUPPORTS_UNIQUE_ID
+#if MCU_HAS_UNIQUE_ID
+	void ReadUniqueId();
 	uint32_t uniqueId[5];
 	char uniqueIdChars[30 + 5 + 1];			// 30 characters, 5 separators, 1 null terminator
 #endif
@@ -622,6 +684,10 @@ private:
 	void SetDriverDirection(uint8_t driver, bool direction) noexcept
 	pre(driver < DRIVES);
 
+#if VARIABLE_NUM_DRIVERS && SUPPORT_12864_LCD
+	size_t numActualDirectDrivers;
+#endif
+
 	bool directions[NumDirectDrivers];
 	int8_t enableValues[NumDirectDrivers];
 
@@ -638,6 +704,12 @@ private:
 	uint32_t driveDriverBits[MaxAxesPlusExtruders + NumDirectDrivers];
 															// the bitmap of local driver port bits for each axis or extruder, followed by the bitmaps for the individual Z motors
 	AxisDriversConfig axisDrivers[MaxAxes];					// the driver numbers assigned to each axis
+	AxesBitmap linearAxes;									// axes that behave like linear axes w.r.t. feedrate handling
+	AxesBitmap rotationalAxes;								// axes that behave like rotational axes w.r.t. feedrate handling
+	AxesBitmap continuousAxes;								// axes that wrap modulo 360
+#if 0	// shortcut axes not implemented yet
+	AxesBitmap shortcutAxes;								// axes that wrap modulo 360 and for which G0 may choose the shortest direction
+#endif
 
 	float pressureAdvance[MaxExtruders];
 #if SUPPORT_NONLINEAR_EXTRUSION
@@ -702,8 +774,13 @@ private:
 	volatile ThermistorAveragingFilter adcFilters[NumAdcFilters];	// ADC reading averaging filters
 
 #if HAS_CPU_TEMP_SENSOR
-	uint32_t highestMcuTemperature, lowestMcuTemperature;
+	float highestMcuTemperature, lowestMcuTemperature;
 	float mcuTemperatureAdjust;
+# if SAME5x
+	TempSenseAveragingFilter tpFilter, tcFilter;
+	int32_t tempCalF1, tempCalF2, tempCalF3, tempCalF4;				// temperature calibration factors
+	void TemperatureCalibrationInit() noexcept;
+# endif
 #endif
 
 	// Axes and endstops
@@ -716,31 +793,21 @@ private:
 #endif
 
 	// Heaters
-	HeatersBitmap configuredHeaters;										// bitmask of all real heaters in use
+	HeatersBitmap configuredHeaters;								// bitmap of all real heaters in use
 
 	// Fans
 	uint32_t lastFanCheckTime;
 
   	// Serial/USB
-	uint32_t baudRates[NUM_SERIAL_CHANNELS];
-	uint8_t commsParams[NUM_SERIAL_CHANNELS];
-
-#ifdef SERIAL_AUX_DEVICE
-	volatile OutputStack auxOutput;
-	Mutex auxMutex;
-#endif
-
-	uint32_t auxSeq;							// Sequence number for AUX devices
-	bool auxEnabled;							// Do we have an AUX device?
-	bool auxRaw;								// true if aux device is in raw mode
-
-#ifdef SERIAL_AUX2_DEVICE
-    volatile OutputStack aux2Output;
-	Mutex aux2Mutex;
-#endif
+	uint32_t baudRates[NumSerialChannels];
+	uint8_t commsParams[NumSerialChannels];
 
 	volatile OutputStack usbOutput;
 	Mutex usbMutex;
+
+#if HAS_AUX_DEVICES
+	AuxDevice auxDevices[NumSerialChannels - 1];
+#endif
 
 	// Files
 #if HAS_MASS_STORAGE
@@ -836,7 +903,7 @@ private:
 	bool deferredPowerDown;
 
 	// Misc
-	bool deliberateError;								// true if we deliberately caused an exception for testing purposes
+	static bool deliberateError;						// true if we deliberately caused an exception for testing purposes. Must be static in case of exception during startup.
 };
 
 #if HAS_MASS_STORAGE
@@ -904,6 +971,24 @@ inline void Platform::SetInstantDv(size_t drive, float value) noexcept
 	instantDvs[drive] = max<float>(value, 0.1);			// don't allow zero or negative values, they causes Move to loop indefinitely
 }
 
+inline size_t Platform::GetNumActualDirectDrivers() const noexcept
+{
+#if VARIABLE_NUM_DRIVERS
+	return numActualDirectDrivers;
+#else
+	return NumDirectDrivers;
+#endif
+}
+
+#if VARIABLE_NUM_DRIVERS
+
+inline void Platform::AdjustNumDrivers(size_t numDriversNotAvailable) noexcept
+{
+	numActualDirectDrivers = NumDirectDrivers - numDriversNotAvailable;
+}
+
+#endif
+
 inline void Platform::SetDirectionValue(size_t drive, bool dVal) noexcept
 {
 	directions[drive] = dVal;
@@ -916,18 +1001,26 @@ inline bool Platform::GetDirectionValue(size_t drive) const noexcept
 
 inline void Platform::SetDriverDirection(uint8_t driver, bool direction) noexcept
 {
-	if (driver < NumDirectDrivers)
+	if (driver < GetNumActualDirectDrivers())
 	{
 		const bool d = (direction == FORWARDS) ? directions[driver] : !directions[driver];
+#if SAME5x
+		IoPort::WriteDigital(DIRECTION_PINS[driver], d);
+#else
 		digitalWrite(DIRECTION_PINS[driver], d);
+#endif
 	}
 }
 
 inline void Platform::SetDriverAbsoluteDirection(size_t driver, bool direction) noexcept
 {
-	if (driver < NumDirectDrivers)
+	if (driver < GetNumActualDirectDrivers())
 	{
+#if SAME5x
+		IoPort::WriteDigital(DIRECTION_PINS[driver], direction);
+#else
 		digitalWrite(DIRECTION_PINS[driver], direction);
+#endif
 	}
 }
 
@@ -953,7 +1046,7 @@ inline float Platform::AxisTotalLength(size_t axis) const noexcept
 
 // For the Duet we use the fan output for this
 // DC 2015-03-21: To allow users to control the cooling fan via gcodes generated by slic3r etc.,
-// only turn the fan on/off if the extruder ancilliary PWM has been set nonzero.
+// only turn the fan on/off if the extruder ancillary PWM has been set nonzero.
 // Caution: this is often called from an ISR, or with interrupts disabled!
 inline void Platform::ExtrudeOn() noexcept
 {

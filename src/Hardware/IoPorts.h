@@ -8,22 +8,28 @@
 #ifndef SRC_IOPORTS_H_
 #define SRC_IOPORTS_H_
 
-#include "RepRapFirmware.h"
+#include <RepRapFirmware.h>
+
+#if SAME5x
+# include <Interrupts.h>
+#endif
 
 // Class to represent a port
 class IoPort
 {
 public:
 	IoPort() noexcept;
+	~IoPort() { Release(); }
+
 	bool SetMode(PinAccess access) noexcept;
 	void Release() noexcept;
 	void AppendDetails(const StringRef& str) const noexcept;
 
 	static size_t AssignPorts(GCodeBuffer& gb, const StringRef& reply, PinUsedBy neededFor, size_t numPorts, IoPort * const ports[], const PinAccess access[]);
-	bool AssignPort(GCodeBuffer& gb, const StringRef& reply, PinUsedBy neededFor, PinAccess access);
+	bool AssignPort(GCodeBuffer& gb, const StringRef& reply, PinUsedBy neededFor, PinAccess access) THROWS(GCodeException);
 
-	static size_t AssignPorts(const char *pinNames, const StringRef& reply, PinUsedBy neededFor, size_t numPorts, IoPort * const ports[], const PinAccess access[]);
-	bool AssignPort(const char *pinName, const StringRef& reply, PinUsedBy neededFor, PinAccess access);
+	static size_t AssignPorts(const char *pinNames, const StringRef& reply, PinUsedBy neededFor, size_t numPorts, IoPort * const ports[], const PinAccess access[]) noexcept;
+	bool AssignPort(const char *pinName, const StringRef& reply, PinUsedBy neededFor, PinAccess access) noexcept;
 
 	void AppendPinName(const StringRef& str) const noexcept;
 	bool IsValid() const noexcept { return logicalPin < NumNamedPins; }
@@ -31,15 +37,17 @@ public:
 	void SetInvert(bool pInvert) noexcept;
 	void ToggleInvert(bool pInvert) noexcept;
 
-	bool Read() const noexcept;
-	bool AttachInterrupt(StandardCallbackFunction callback, enum InterruptMode mode, CallbackParameter param) const noexcept;
+	bool ReadDigital() const noexcept;
+	bool AttachInterrupt(StandardCallbackFunction callback, InterruptMode mode, CallbackParameter param) const noexcept;
 	void DetachInterrupt() const noexcept;
 
 	uint16_t ReadAnalog() const noexcept;
-	AnalogChannelNumber GetAnalogChannel() const noexcept { return PinToAdcChannel(PinTable[logicalPin].pin); }
+
+	AnalogChannelNumber GetAnalogChannel() const noexcept { return PinToAdcChannel(GetPin()); }
 
 	void WriteDigital(bool high) const noexcept;
 
+	// Get the physical pin, or NoPin if the logical pin is not valid
 	Pin GetPin() const noexcept;
 
 	// Initialise static data
@@ -58,7 +66,18 @@ public:
 	static void WriteAnalog(Pin p, float pwm, uint16_t frequency) noexcept;
 
 protected:
-	bool Allocate(const char *pinName, const StringRef& reply, PinUsedBy neededFor, PinAccess access);
+	bool Allocate(const char *pinName, const StringRef& reply, PinUsedBy neededFor, PinAccess access) noexcept;
+
+	// Get the physical pin without checking the validity of the logical pin
+	Pin GetPinNoCheck() const noexcept
+	{
+#if SAME5x
+		// New-style pin table is indexed by pin number
+		return logicalPin;
+#else
+		return PinTable[logicalPin].pin;
+#endif
+	}
 
 	static const char* TranslatePinAccess(PinAccess access) noexcept;
 

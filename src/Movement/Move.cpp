@@ -89,6 +89,7 @@ constexpr ObjectModelTableEntry Move::objectModelTable[] =
 	{ "speedFactor",			OBJECT_MODEL_FUNC_NOSELF(reprap.GetGCodes().GetSpeedFactor(), 2),						ObjectModelEntryFlags::none },
 	{ "travelAcceleration",		OBJECT_MODEL_FUNC(self->maxTravelAcceleration, 1),										ObjectModelEntryFlags::none },
 	{ "virtualEPos",			OBJECT_MODEL_FUNC_NOSELF(reprap.GetGCodes().GetVirtualExtruderPosition(), 5),			ObjectModelEntryFlags::live },
+	{ "workplaceNumber",		OBJECT_MODEL_FUNC_NOSELF((int32_t)reprap.GetGCodes().GetWorkplaceCoordinateSystemNumber() - 1),	ObjectModelEntryFlags::none },
 	{ "workspaceNumber",		OBJECT_MODEL_FUNC_NOSELF((int32_t)reprap.GetGCodes().GetWorkplaceCoordinateSystemNumber()),	ObjectModelEntryFlags::none },
 
 	// 1. Move.Daa members
@@ -143,7 +144,7 @@ constexpr ObjectModelTableEntry Move::objectModelTable[] =
 	{ "tanYZ",					OBJECT_MODEL_FUNC(self->tanYZ, 4),														ObjectModelEntryFlags::none },
 };
 
-constexpr uint8_t Move::objectModelTableDescriptor[] = { 10, 13, 3, 2, 4 + SUPPORT_LASER, 3, 2, 2, 5 + (HAS_MASS_STORAGE || HAS_LINUX_INTERFACE), 2, 3 };
+constexpr uint8_t Move::objectModelTableDescriptor[] = { 10, 14, 3, 2, 4 + SUPPORT_LASER, 3, 2, 2, 5 + (HAS_MASS_STORAGE || HAS_LINUX_INTERFACE), 2, 3 };
 
 DEFINE_GET_OBJECT_MODEL_TABLE(Move)
 
@@ -185,7 +186,7 @@ void Move::Init() noexcept
 	SetIdentityTransform();
 	tanXY = tanYZ = tanXZ = 0.0;
 
-	usingMesh = useTaper = executeAllMoves = false;
+	usingMesh = useTaper = false;
 	zShift = 0.0;
 
 	idleTimeout = DefaultIdleTimeout;
@@ -296,7 +297,7 @@ void Move::Spin() noexcept
 		}
 	}
 
-	mainDDARing.Spin(simulationMode, executeAllMoves || idleCount > 10);	// let the DDA ring process moves. Better to have a few moves in the queue so that we can do lookahead, hence the test on idleCount.
+	mainDDARing.Spin(simulationMode, idleCount > 10);	// let the DDA ring process moves. Better to have a few moves in the queue so that we can do lookahead, hence the test on idleCount.
 
 #if SUPPORT_ASYNC_MOVES
 	if (auxMoveAvailable && auxDDARing.CanAddMove())
@@ -317,7 +318,9 @@ void Move::Spin() noexcept
 #endif
 	   )
 	{
-		if (moveState == MoveState::executing && !reprap.GetGCodes().IsPaused())
+		if (   moveState == MoveState::executing
+			&& reprap.GetGCodes().GetPauseState() == PauseState::notPaused	// for now we don't go into idle hold when we are paused (is this sensible?)
+		   )
 		{
 			lastStateChangeTime = millis();				// record when we first noticed that the machine was idle
 			moveState = MoveState::timing;
@@ -332,6 +335,12 @@ void Move::Spin() noexcept
 	{
 		moveState = MoveState::executing;
 	}
+}
+
+// Tell the lookahead ring we are waiting for it to empty and return true if it is
+bool Move::WaitingForAllMovesFinished() noexcept
+{
+	return mainDDARing.SetWaitingToEmpty();
 }
 
 // Return the number of currently used probe points
@@ -481,7 +490,7 @@ void Move::Diagnostics(MessageType mtype) noexcept
 void Move::SetNewPosition(const float positionNow[MaxAxesPlusExtruders], bool doBedCompensation) noexcept
 {
 	float newPos[MaxAxesPlusExtruders];
-	memcpy(newPos, positionNow, sizeof(newPos));			// copy to local storage because Transform modifies it
+	memcpyf(newPos, positionNow, ARRAY_SIZE(newPos));			// copy to local storage because Transform modifies it
 	AxisAndBedTransform(newPos, reprap.GetCurrentTool(), doBedCompensation);
 	SetLiveCoordinates(newPos);
 	mainDDARing.SetPositions(newPos);
@@ -715,7 +724,7 @@ void Move::InverseBedTransform(float xyzPoint[MaxAxes], const Tool *tool) const 
 void Move::SetZeroHeightError(const float coords[MaxAxes]) noexcept
 {
 	float tempCoords[MaxAxes];
-	memcpy(tempCoords, coords, sizeof(tempCoords));
+	memcpyf(tempCoords, coords, ARRAY_SIZE(tempCoords));
 	AxisTransform(tempCoords, nullptr);
 	zShift = -GetInterpolatedHeightError(tempCoords[X_AXIS], tempCoords[Y_AXIS]);
 }

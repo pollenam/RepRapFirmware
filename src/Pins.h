@@ -4,25 +4,12 @@
 // Load Pins_<platform>.h
 
 #if !defined(PLATFORM)
-# if defined(__SAM3X8E__)
-#  if defined(__RADDS__)
-#   define PLATFORM RADDS
-#  elif defined(__ALLIGATOR__)
-#	define PLATFORM Alligator
-#  else
-#   define PLATFORM Duet
-#  endif
-# elif defined(__SAM4E8E__)
+# if defined(__SAM4E8E__)
 #  define PLATFORM DuetNG
-# elif defined(__SAME70Q21__) || defined(__SAME70Q20B__) || defined(__SAME70Q21B__)
-#  if defined(DUET3_V03)
-#   define PLATFORM Duet3_V03
-#  elif defined(DUET3_V05)
-#   define PLATFORM Duet3_V05
-#  elif defined(DUET3_V06)
+# elif defined(__SAME70Q20B__) || defined(__SAME70Q21B__)
+#  if defined(DUET3_V06)
 #   define PLATFORM Duet3_V06
-#  elif defined(SAME70XPLD)
-#   define PLATFORM SAME70xpld
+#   define DUET3		1
 #  else
 #   error Unknown platform
 #  endif
@@ -30,15 +17,14 @@
 #  define PLATFORM DuetM
 # elif defined(PCCB)
 #  define PLATFORM Pccb
+# elif defined(DUET3MINI_V02) || defined(DUET3MINI_V04)
+#  define DUET3MINI		1
+#  define PLATFORM Duet3Mini
 # elif defined(__LPC17xx__)
 #  define PLATFORM LPC
 # else
 #  error Unknown platform
 # endif
-#endif
-
-#if defined(DUET3_V03) || defined(DUET3_V05) || defined(DUET3_V06)
-# define DUET3	1
 #endif
 
 #if !defined(P_INCLUDE_FILE)
@@ -76,6 +62,8 @@
 # define SUPPORT_DOTSTAR_LED	0
 #endif
 
+#define HAS_AUX_DEVICES			(defined(SERIAL_AUX_DEVICE))		// if SERIAL_AUX_DEVICE is defined then we have one or more aux devices
+
 #ifndef USE_CACHE
 # define USE_CACHE				0
 #endif
@@ -96,6 +84,10 @@
 # define SUPPORT_TMC51xx		0
 #endif
 
+#ifndef VARIABLE_NUM_DRIVERS
+# define VARIABLE_NUM_DRIVERS	0
+#endif
+
 #ifndef SUPPORT_CAN_EXPANSION
 # define SUPPORT_CAN_EXPANSION	0
 #endif
@@ -109,7 +101,9 @@
 #endif
 
 #define HAS_SMART_DRIVERS		(SUPPORT_TMC2660 || SUPPORT_TMC22xx || SUPPORT_TMC51xx)
-#define HAS_STALL_DETECT		(SUPPORT_TMC2660 || SUPPORT_TMC51xx)
+#ifndef HAS_STALL_DETECT
+# define HAS_STALL_DETECT		(SUPPORT_TMC2660 || SUPPORT_TMC51xx)
+#endif
 
 #ifndef HAS_12V_MONITOR
 # define HAS_12V_MONITOR		0
@@ -148,6 +142,10 @@
 
 #define HAS_NETWORKING			(HAS_LWIP_NETWORKING || HAS_WIFI_NETWORKING || HAS_W5500_NETWORKING || HAS_LEGACY_NETWORKING || HAS_RTOSPLUSTCP_NETWORKING || HAS_ESP32_NETWORKING)
 
+#ifndef SUPPORT_HTTP
+# define SUPPORT_HTTP			HAS_NETWORKING
+#endif
+
 #ifndef SUPPORT_FTP
 # define SUPPORT_FTP			HAS_NETWORKING
 #endif
@@ -172,11 +170,17 @@
 # define ALLOCATE_DEFAULT_PORTS	0
 #endif
 
-// We must define SUPPORTS_UNIQUE_ID as either 0 or 1 so we can use it in maths
-#if SAM4E || SAM4S || SAME70
-# define SUPPORTS_UNIQUE_ID		1
+// We must define MCU_HAS_UNIQUE_ID as either 0 or 1 so we can use it in maths
+#if SAM4E || SAM4S || SAME70 || SAME5x
+# define MCU_HAS_UNIQUE_ID		1
 #else
-# define SUPPORTS_UNIQUE_ID		0
+# define MCU_HAS_UNIQUE_ID		0
+#endif
+
+#if SAME70 || SAME5x
+# define MCU_HAS_TRUERANDOM	1
+#else
+# define MCU_HAS_TRUERANDOM	0
 #endif
 
 #endif // PINS_H__

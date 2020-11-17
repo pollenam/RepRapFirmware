@@ -179,7 +179,7 @@ float FiveBarScaraKinematics::getAbsoluteAngle(float xOrig, float yOrig, float x
 {
 	const float length = sqrtf(fsquare(xOrig - xDest) + fsquare(yOrig - yDest));
 	const float y = fabs(yOrig - yDest);
-	float angle = asin(y / length) * 180.0f / M_PI;
+	float angle = asinf(y / length) * 180.0f / Pi;
 
 	const int quad = getQuadrant(xDest - xOrig, yDest - yOrig);
 
@@ -934,7 +934,7 @@ void FiveBarScaraKinematics::LimitSpeedAndAcceleration(DDA& dda, const float *no
 // Return true if the specified axis is a continuous rotation axis
 bool FiveBarScaraKinematics::IsContinuousRotationAxis(size_t axis) const noexcept
 {
-	return axis == X_AXIS || axis == Y_AXIS;
+	return axis == X_AXIS || axis == Y_AXIS || Kinematics::IsContinuousRotationAxis(axis);
 }
 
 AxesBitmap FiveBarScaraKinematics::GetLinearAxes() const noexcept

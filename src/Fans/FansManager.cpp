@@ -103,7 +103,7 @@ GCodeResult FansManager::ConfigureFanPort(GCodeBuffer& gb, const StringRef& repl
 		WriteLocker lock(fansLock);
 
 		Fan *oldFan = nullptr;
-		std::swap<Fan*>(oldFan, fans[fanNum]);
+		std::swap(oldFan, fans[fanNum]);
 		delete oldFan;
 
 		const PwmFrequency freq = (gb.Seen('Q')) ? gb.GetPwmFrequency() : DefaultFanPwmFreq;
@@ -182,10 +182,30 @@ GCodeResult FansManager::SetFanValue(size_t fanNum, float speed, const StringRef
 	return GCodeResult::error;
 }
 
-void FansManager::SetFanValue(size_t fanNum, float speed) noexcept
+// Update the PWM of the specified fan, returning the PWM change
+float FansManager::SetFanValue(size_t fanNum, float speed) noexcept
 {
-	String<1> dummy;
-	(void)SetFanValue(fanNum, speed, dummy.GetRef());
+	auto fan = FindFan(fanNum);
+	if (fan.IsNotNull())
+	{
+		const float oldPwm = fan->GetPwm();
+		String<1> dummy;
+		(void)fan->SetPwm(speed, dummy.GetRef());
+		return fan->GetPwm() - oldPwm;
+	}
+	return 0.0;
+}
+
+// Update the PWM of the specified fans, returning the total PWM change divided by the number of fans
+float FansManager::SetFansValue(FansBitmap whichFans, float speed) noexcept
+{
+	float pwmChange = 0;
+	if (!whichFans.IsEmpty())
+	{
+		whichFans.Iterate([speed, this, &pwmChange](unsigned int i, unsigned int) noexcept { pwmChange += SetFanValue(i, speed); });
+		pwmChange /= whichFans.CountSetBits();
+	}
+	return pwmChange;
 }
 
 // Check if the given fan can be controlled manually so that DWC can decide whether or not to show the corresponding fan
@@ -217,7 +237,11 @@ void FansManager::Init() noexcept
 	for (size_t i = 0; i < ARRAY_SIZE(DefaultFanPinNames); ++i)
 	{
 		String<1> dummy;
-		fans[i] = CreateLocalFan(i, DefaultFanPinNames[i], i < ARRAY_SIZE(DefaultFanPwmFrequencies) ? DefaultFanPwmFrequencies[i] : DefaultFanPwmFreq, dummy.GetRef());
+		fans[i] = CreateLocalFan(i,
+									DefaultFanPinNames[i],
+									i < ARRAY_SIZE(DefaultFanPwmFrequencies) && DefaultFanPwmFrequencies[i] != 0 ? DefaultFanPwmFrequencies[i] : DefaultFanPwmFreq,
+									dummy.GetRef()
+								);
 	}
 
 # if defined(PCCB)
@@ -229,6 +253,19 @@ void FansManager::Init() noexcept
 	}
 # endif
 #endif
+}
+
+// Shut down the fans system, in particular stop any interrupts into Fan objects. Called before loading IAP into the last 64K of RAM.
+// The simplest way is to delete all the fans.
+void FansManager::Exit() noexcept
+{
+	WriteLocker lock(fansLock);
+	for (Fan*& fan : fans)
+	{
+		Fan *f;
+		std::swap(f, fan);
+		delete f;
+	}
 }
 
 #if SUPPORT_CAN_EXPANSION

@@ -51,10 +51,9 @@ public:
 
 	bool Put(char c) noexcept __attribute__((hot));								// Add a character to the end
 #if HAS_LINUX_INTERFACE
-	void PutAndDecode(const char *data, size_t len, bool isBinary = false) noexcept;	// Add an entire G-Code, overwriting any existing content
-#else
-	void PutAndDecode(const char *data, size_t len) noexcept;					// Add an entire G-Code, overwriting any existing content
+	void PutBinary(const uint32_t *data, size_t len) noexcept;						// Add an entire binary G-Code, overwriting any existing content
 #endif
+	void PutAndDecode(const char *data, size_t len) noexcept;					// Add an entire G-Code, overwriting any existing content
 	void PutAndDecode(const char *str) noexcept;								// Add a null-terminated string, overwriting any existing content
 	void StartNewFile() noexcept;												// Called when we start a new file
 	bool FileEnded() noexcept;													// Called when we reach the end of the file we are reading from
@@ -64,7 +63,8 @@ public:
 	char GetCommandLetter() const noexcept;
 	bool HasCommandNumber() const noexcept;
 	int GetCommandNumber() const noexcept;
-	int8_t GetCommandFraction() const noexcept;
+	int8_t GetCommandFraction() const noexcept;										// Return the command fraction, or -1 if none given
+	bool ContainsExpression() const noexcept;
 	void GetCompleteParameters(const StringRef& str) THROWS(GCodeException);		// Get all of the line following the command. Currently called only for the Q0 command.
 	int32_t GetLineNumber() const noexcept { return machineState->lineNumber; }
 	GCodeResult GetLastResult() const noexcept { return lastResult; }
@@ -79,8 +79,9 @@ public:
 	int32_t GetLimitedIValue(char c, int32_t minValue, int32_t maxValue) THROWS(GCodeException)
 		post(minValue <= result; result <= maxValue);								// Get an integer after a key letter
 	uint32_t GetUIValue() THROWS(GCodeException);									// Get an unsigned integer value
-	uint32_t GetLimitedUIValue(char c, uint32_t maxValuePlusOne) THROWS(GCodeException)
-		post(result < maxValuePlusOne);												// Get an unsigned integer value, throw if >= limit
+	uint32_t GetLimitedUIValue(char c, uint32_t maxValuePlusOne, uint32_t minValue = 0) THROWS(GCodeException)
+		pre(maxValuePlusOne > minValue)
+		post(result >= minValue; result < maxValuePlusOne);							// Get an unsigned integer value, throw if outside limits
 	void GetIPAddress(IPAddress& returnedIp) THROWS(GCodeException);				// Get an IP address quad after a key letter
 	void GetMacAddress(MacAddress& mac) THROWS(GCodeException);						// Get a MAC address sextet after a key letter
 	PwmFrequency GetPwmFrequency() THROWS(GCodeException);							// Get a PWM frequency
@@ -122,32 +123,45 @@ public:
 	bool PushState(bool withinSameFile) noexcept;				// Push state returning true if successful (i.e. stack not overflowed)
 	bool PopState(bool withinSameFile) noexcept;				// Pop state returning true if successful (i.e. no stack underrun)
 
-	bool IsPausing() const;
-	bool IsResuming() const;
-
 	void AbortFile(bool abortAll, bool requestAbort = true) noexcept;
 	bool IsDoingFile() const noexcept;							// Return true if this source is executing a file
 	bool IsDoingLocalFile() const noexcept;						// Return true if this source is executing a file from the local SD card
 	bool IsDoingFileMacro() const noexcept;						// Return true if this source is executing a file macro
 	FilePosition GetFilePosition() const noexcept;				// Get the file position at the start of the current command
 
+	void WaitForAcknowledgement() noexcept;						// Flag that we are waiting for acknowledgement
+
 #if HAS_LINUX_INTERFACE
 	bool IsBinary() const noexcept { return isBinaryBuffer; }	// Return true if the code is in binary format
-	void FinishedBinaryMode() noexcept { isBinaryBuffer = false; }
 
-	void SetPrintFinished() noexcept;							// Mark the print file as finished
 	bool IsFileFinished() const noexcept;						// Return true if this source has finished execution of a file
+	void SetFileFinished() noexcept;							// Mark the current file as finished
+	void SetPrintFinished() noexcept;							// Mark the current print file as finished
 
-	bool IsMacroRequested() const noexcept { return macroRequested; }	// Indicates if a macro file is being requested
-	void RequestMacroFile(const char *filename, bool reportMissing, bool fromCode) noexcept;	// Request execution of a file macro
-	const char *GetRequestedMacroFile(bool& reportMissing, bool &fromCode) const noexcept;		// Return requested macro file or nullptr if none
-	void MacroRequestSent() noexcept { macroRequested = false; }		// Called when a macro file request has been sent
+	bool RequestMacroFile(const char *filename, bool fromCode) noexcept;	// Request execution of a file macro
+	volatile bool IsWaitingForMacro() const noexcept { return isWaitingForMacro; }	// Indicates if the GB is waiting for a macro to be opened
+	bool HasJustStartedMacro() const noexcept { return macroJustStarted; }	// Has this GB just started a new macro file?
+	bool IsMacroRequestPending() const noexcept { return !requestedMacroFile.IsEmpty(); }		// Indicates if a macro file is being requested
+	const char *GetRequestedMacroFile() const noexcept { return requestedMacroFile.c_str(); }	// Return requested macro file or nullptr if none
+	bool IsMacroStartedByCode() const noexcept;								// Indicates if the last macro was requested from a code
+	void MacroRequestSent() noexcept { requestedMacroFile.Clear(); }		// Called when a macro file request has been sent
+	void ResolveMacroRequest(bool hadError, bool isEmpty) noexcept;			// Resolve the call waiting for a macro to be executed
+	bool IsMacroEmpty() const noexcept { return macroFileEmpty; }			// Return true if the opened macro file is actually empty
 
-	bool IsAbortRequested() const noexcept;						// Is the cancellation of the current file requested?
-	bool IsAbortAllRequested() const noexcept;					// Is the cancellation of all files being executed on this channel requested?
-	void AcknowledgeAbort() noexcept;							// Indicates that the current macro file is being cancelled
+	void MacroFileClosed() noexcept;										// Called to notify the SBC about the file being internally closed on success
+	volatile bool IsMacroFileClosed() const noexcept { return macroFileClosed; }	// Indicates if a file has been closed internally in RRF
+	void MacroFileClosedSent() noexcept { macroFileClosed = false; }		// Called when the SBC has been notified about the internally closed file
 
-	bool IsInvalidated() const noexcept { return invalidated; }	// Indicates if the channel is invalidated
+	bool IsAbortRequested() const noexcept { return abortFile; }			// Is the cancellation of the current file requested?
+	bool IsAbortAllRequested() const noexcept { return abortAllFiles; }		// Is the cancellation of all files being executed on this channel requested?
+	void FileAbortSent() noexcept { abortFile = abortAllFiles = false; }	// Called when the SBC has been notified about a file (or all files) being closed
+
+	bool IsMessagePromptPending() const noexcept { return messagePromptPending; }	// Is the SBC supposed to be notified about a message waiting for acknowledgement?
+	void MessagePromptSent() noexcept { messagePromptPending = false; }				// Called when the SBC has been notified about a message waiting for acknowledgement
+	bool IsMessageAcknowledged() const noexcept { return messageAcknowledged; }		// Indicates if a message has been acknowledged
+	void MessageAcknowledgementSent() noexcept { messageAcknowledged = false; }		// Called when the SBC has been notified about the message acknowledgement
+
+	bool IsInvalidated() const noexcept { return invalidated; }		// Indicates if the channel is invalidated
 	void Invalidate(bool i = true) noexcept { invalidated = i; }	// Invalidate this channel (or not)
 
 	bool IsSendRequested() const noexcept { return sendToSbc; }	// Is this code supposed to be sent to the SBC
@@ -156,6 +170,7 @@ public:
 
 	GCodeState GetState() const noexcept;
 	void SetState(GCodeState newState) noexcept;
+	void SetState(GCodeState newState, uint16_t param) noexcept;
 	void AdvanceState() noexcept;
 	void MessageAcknowledged(bool cancelled) noexcept;
 
@@ -171,7 +186,7 @@ public:
 	void WriteToFile() noexcept;								// Write the current GCode to file
 
 	bool IsWritingBinary() const noexcept;						// Returns true if writing binary
-	void WriteBinaryToFile(char b) noexcept;					// Write a byte to the file
+	bool WriteBinaryToFile(char b) noexcept;					// Write a byte to the file, returning true if the upload is now complete
 	void FinishWritingBinary() noexcept;
 #endif
 
@@ -187,6 +202,9 @@ public:
 	void StopTimer() noexcept { timerRunning = false; }
 	bool DoDwellTime(uint32_t dwellMillis) noexcept;			// Execute a dwell returning true if it has finished
 
+	void ResetReportDueTimer() noexcept { whenReportDueTimerStarted = millis(); };
+	bool IsReportDue() noexcept;
+
 	void RestartFrom(FilePosition pos) noexcept;
 
 #if HAS_MASS_STORAGE
@@ -197,6 +215,8 @@ public:
 	void MotionCommanded() noexcept { motionCommanded = true; }
 	void MotionStopped() noexcept { motionCommanded = false; }
 	bool WasMotionCommanded() const noexcept { return motionCommanded; }
+
+	Mutex mutex;
 
 protected:
 	DECLARE_OBJECT_MODEL
@@ -228,6 +248,8 @@ private:
 	GCodeMachineState *machineState;					// Machine state for this gcode source
 
 	uint32_t whenTimerStarted;							// When we started waiting
+	uint32_t whenReportDueTimerStarted;					// When the report-due-timer has been started
+	static constexpr uint32_t reportDueInterval = 1000;	// Interval in which we send in ms
 
 #if HAS_LINUX_INTERFACE
 	bool isBinaryBuffer;
@@ -242,22 +264,50 @@ private:
 #endif
 
 #if HAS_LINUX_INTERFACE
+	// Accessed by both the Main and Linux tasks
+	BinarySemaphore macroSemaphore;
+	volatile bool isWaitingForMacro;	// Is this GB waiting in DoFileMacro?
+	volatile bool macroFileClosed;		// Last macro file has been closed in RRF, tell the SBC
+
+	// Accessed only when the GB mutex is acquired
 	String<MaxFilenameLength> requestedMacroFile;
 	uint8_t
-		reportMissingMacro : 1,
-		isMacroFromCode : 1,
-		macroRequested : 1,
-		abortFile : 1,
-		abortAllFiles : 1,
-		invalidated : 1,
-		sendToSbc : 1;
+		macroJustStarted : 1,		// Whether the GB has just started a macro file
+		macroFileError : 1,			// Whether the macro file could be opened or if an error occurred
+		macroFileEmpty : 1,			// Whether the macro file is actually empty
+		abortFile : 1,				// Whether to abort the last file on the stack
+		abortAllFiles : 1,			// Whether to abort all opened files
+		sendToSbc : 1,				// Indicates if the GB string content is supposed to be sent to the SBC
+		messagePromptPending : 1,	// Has the SBC been notified about a message waiting for acknowledgement?
+		messageAcknowledged : 1;	// Last message has been acknowledged
+
+	// Accessed only by the Linux task
+	bool invalidated;				// Set to true if the GB content is not valid and about to be cleared
 #endif
 };
 
 inline bool GCodeBuffer::IsDoingFileMacro() const noexcept
 {
+#if HAS_LINUX_INTERFACE
+	return machineState->doingFileMacro || IsMacroRequestPending();
+#else
 	return machineState->doingFileMacro;
+#endif
 }
+
+#if HAS_LINUX_INTERFACE
+
+inline bool GCodeBuffer::IsFileFinished() const noexcept
+{
+	return machineState->fileFinished;
+}
+
+inline bool GCodeBuffer::IsMacroStartedByCode() const noexcept
+{
+	return machineState->macroStartedByCode;
+}
+
+#endif
 
 inline GCodeState GCodeBuffer::GetState() const noexcept
 {
@@ -269,6 +319,12 @@ inline void GCodeBuffer::SetState(GCodeState newState) noexcept
 	machineState->SetState(newState);
 }
 
+inline void GCodeBuffer::SetState(GCodeState newState, uint16_t param) noexcept
+{
+	machineState->stateParameter = param;
+	machineState->SetState(newState);
+}
+
 inline void GCodeBuffer::AdvanceState() noexcept
 {
 	machineState->AdvanceState();
@@ -277,12 +333,26 @@ inline void GCodeBuffer::AdvanceState() noexcept
 // Return true if we can queue gcodes from this source. This is the case if a file is being executed
 inline bool GCodeBuffer::CanQueueCodes() const noexcept
 {
-	return IsDoingFile();
+	return machineState->DoingFile();
 }
 
 inline bool GCodeBuffer::IsDoingFile() const noexcept
 {
+#if HAS_LINUX_INTERFACE
+	return machineState->DoingFile() || IsMacroRequestPending();
+#else
 	return machineState->DoingFile();
+#endif
+}
+
+inline bool GCodeBuffer::IsReady() const noexcept
+{
+	return bufferState == GCodeBufferState::ready;
+}
+
+inline bool GCodeBuffer::IsExecuting() const noexcept
+{
+	return bufferState == GCodeBufferState::executing;
 }
 
 // Return true if this source is executing a file from the local SD card
@@ -294,24 +364,5 @@ inline bool GCodeBuffer::IsDoingLocalFile() const noexcept
 	return IsDoingFile();
 #endif
 }
-
-#if HAS_LINUX_INTERFACE
-
-inline bool GCodeBuffer::IsAbortRequested() const noexcept
-{
-	return abortFile;
-}
-
-inline bool GCodeBuffer::IsAbortAllRequested() const noexcept
-{
-	return abortAllFiles;
-}
-
-inline void GCodeBuffer::AcknowledgeAbort() noexcept
-{
-	abortFile = abortAllFiles = false;
-}
-
-#endif
 
 #endif /* SRC_GCODES_GCODEBUFFER_GCODEBUFFER_H */

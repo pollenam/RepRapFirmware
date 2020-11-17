@@ -46,8 +46,9 @@ public:
 	void Taken(size_t len) noexcept { bytesRead += len; }
 	size_t BytesLeft() const noexcept { return dataLength - bytesRead; }	// How many bytes have not been sent yet?
 
-	size_t printf(const char *fmt, ...) noexcept __attribute__ ((format (printf, 2, 3)));
 	size_t vprintf(const char *fmt, va_list vargs) noexcept;
+	size_t printf(const char *fmt, ...) noexcept __attribute__ ((format (printf, 2, 3)));
+	size_t vcatf(const char *fmt, va_list vargs) noexcept;
 	size_t catf(const char *fmt, ...) noexcept __attribute__ ((format (printf, 2, 3)));
 	size_t lcatf(const char *fmt, ...) noexcept __attribute__ ((format (printf, 2, 3)));
 
@@ -99,9 +100,11 @@ public:
 
 	static void Diagnostics(MessageType mtype) noexcept;
 
-	static unsigned int GetFreeBuffers() { return OUTPUT_BUFFER_COUNT - usedOutputBuffers; }
+	static unsigned int GetFreeBuffers() noexcept { return OUTPUT_BUFFER_COUNT - usedOutputBuffers; }
 
 private:
+	void Clear() noexcept;
+
 	OutputBuffer *next;
 	OutputBuffer *last;
 

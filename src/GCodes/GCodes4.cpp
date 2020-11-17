@@ -197,6 +197,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 				{
 					reply.printf("Homing file %s not found", nextHomingFileName.c_str());
 					stateMachineResult = GCodeResult::error;
+					toBeHomed.Clear();
 					gb.SetState(GCodeState::normal);
 				}
 			}
@@ -211,6 +212,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 			{
 				reply.copy("Homing failed");
 				stateMachineResult = GCodeResult::error;
+				toBeHomed.Clear();
 				gb.SetState(GCodeState::normal);
 			}
 			else
@@ -273,9 +275,9 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 			UpdateCurrentUserPosition();				// get the actual position of the new tool
 
 			gb.AdvanceState();
-			if (machineType != MachineType::fff)
+			if (machineType != MachineType::fff || toolChangeParam == 0)
 			{
-				gb.AdvanceState();						// skip moving tool to the new height if not a 3D printer
+				gb.AdvanceState();						// skip moving tool to the new height if not a 3D printer or Tn P0 was given
 			}
 
 			if (reprap.GetCurrentTool() != nullptr && (toolChangeParam & TPostBit) != 0)	// 2020-04-29: run tpost file even if not all axes have been homed
@@ -291,6 +293,21 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 	case GCodeState::m109ToolChange3:					// move the new tool to the correct height
 		if (LockMovementAndWaitForStandstill(gb))		// wait for tpost.g to finish executing
 		{
+			// Check here if the tool offsets being applied would exceed Z axis limits
+			auto currentTool = reprap.GetCurrentTool();
+			if (currentTool != nullptr)
+			{
+				const float newZPos = (moveBuffer.coords[Z_AXIS] - currentTool->GetOffset(Z_AXIS));
+				if(newZPos > platform.AxisMaximum(Z_AXIS) || newZPos < platform.AxisMinimum(Z_AXIS))
+				{
+					gb.MachineState().feedRate = toolChangeRestorePoint.feedRate;
+					doingToolChange = false;
+					gb.MachineState().SetError("New tool too close to Z axis limit. Aborting tool change");
+					AbortPrint(gb);
+					gb.SetState(GCodeState::checkError);
+					break;
+				}
+			}
 			// Restore the original Z axis user position, so that different tool Z offsets work even if the first move after the tool change doesn't have a Z coordinate
 			// Only do this if we are running as an FDM printer, because it's not appropriate for CNC machines.
 			SetMoveBufferDefaults();
@@ -331,7 +348,6 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 		}
 		else
 		{
-			CheckReportDue(gb, reply);
 			isWaiting = true;
 		}
 		break;
@@ -353,9 +369,28 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 			gb.AdvanceState();
 			if (AllAxesAreHomed())
 			{
-				if (!DoFileMacro(gb, FILAMENT_CHANGE_G, false, 600))
+				if (!DoFileMacro(gb, FILAMENT_CHANGE_G, false, -1))
 				{
-					DoFileMacro(gb, PAUSE_G, true, 600);
+					DoFileMacro(gb, PAUSE_G, true, -1);
+				}
+			}
+		}
+		break;
+
+	case GCodeState::filamentErrorPause1:
+		if (LockMovementAndWaitForStandstill(gb))
+		{
+			gb.AdvanceState();
+			if (AllAxesAreHomed())
+			{
+				String<StringLength20> macroName;
+				macroName.printf(FILAMENT_ERROR "%u.g", gb.MachineState().stateParameter);
+				if (!DoFileMacro(gb, macroName.c_str(), false, -1))
+				{
+					if (!DoFileMacro(gb, FILAMENT_ERROR ".g", false, -1))
+					{
+						DoFileMacro(gb, PAUSE_G, true, -1);
+					}
 				}
 			}
 		}
@@ -363,6 +398,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 
 	case GCodeState::pausing2:
 	case GCodeState::filamentChangePause2:
+	case GCodeState::filamentErrorPause2:
 		if (LockMovementAndWaitForStandstill(gb))
 		{
 			reply.printf((gb.GetState() == GCodeState::filamentChangePause2) ? "Printing paused for filament change at" : "Printing paused at");
@@ -370,7 +406,8 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 			{
 				reply.catf(" %c%.1f", axisLetters[axis], (double)pauseRestorePoint.moveCoords[axis]);
 			}
-			platform.MessageF(LogMessage, "%s\n", reply.c_str());
+			platform.MessageF(LogWarn, "%s\n", reply.c_str());
+			pauseState = PauseState::paused;
 			gb.SetState(GCodeState::normal);
 		}
 		break;
@@ -418,19 +455,20 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 			moveFractionToSkip = pauseRestorePoint.proportionDone;
 			restartInitialUserX = pauseRestorePoint.initialUserX;
 			restartInitialUserY = pauseRestorePoint.initialUserY;
-			isPaused = false;
 			reply.copy("Printing resumed");
-			platform.Message(LogMessage, "Printing resumed\n");
+			platform.Message(LogWarn, "Printing resumed\n");
+			pauseState = PauseState::notPaused;
 			gb.SetState(GCodeState::normal);
 		}
 		break;
 
 	case GCodeState::flashing1:
 #if HAS_WIFI_NETWORKING
-		if (&gb == auxGCode)								// if M997 S1 is sent from USB, don't keep sending temperature reports
-		{
-			CheckReportDue(gb, reply);						// this is so that the ATE gets status reports and can tell when flashing is complete
-		}
+// wilriker: This probably can be removed
+//		if (&gb == auxGCode)								// if M997 S1 is sent from USB, don't keep sending temperature reports
+//		{
+//			CheckReportDue(gb, reply);						// this is so that the ATE gets status reports and can tell when flashing is complete
+//		}
 
 		// Update additional modules before the main firmware
 		if (FirmwareUpdater::IsReady())
@@ -533,7 +571,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 	case GCodeState::gridProbing2b:		// ready to probe the current grid probe point
 		if (LockMovementAndWaitForStandstill(gb))
 		{
-			lastProbedTime = millis();
+			lastProbedTime = millis();														// start the recovery timer
 			const auto zp = platform.GetZProbeOrDefault(currentZProbeNumber);
 			if (zp->GetProbeType() != ZProbeType::none && zp->GetTurnHeatersOff())
 			{
@@ -543,7 +581,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 		}
 		break;
 
-	case GCodeState::gridProbing3:	// ready to probe the current grid probe point
+	case GCodeState::gridProbing3:		// ready to probe the current grid probe point
 		{
 			const auto zp = platform.GetZProbeOrDefault(currentZProbeNumber);
 			if (millis() - lastProbedTime >= (uint32_t)(zp->GetRecoveryTime() * SecondsToMillis))
@@ -560,6 +598,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 				}
 				else if (zp->Stopped() == EndStopHit::atStop)
 				{
+					reprap.GetMove().heightMapLock.ReleaseWriter();
 					reprap.GetHeat().SuspendHeaters(false);
 					gb.MachineState().SetError("Z probe already triggered before probing move started");
 					gb.SetState(GCodeState::checkError);
@@ -570,14 +609,14 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 				{
 					zProbeTriggered = false;
 					SetMoveBufferDefaults();
-					if (!platform.GetEndstops().EnableZProbe(currentZProbeNumber))
+					if (!platform.GetEndstops().EnableZProbe(currentZProbeNumber) || !zp->SetProbing(true))
 					{
+						reprap.GetMove().heightMapLock.ReleaseWriter();
 						gb.MachineState().SetError("Failed to enable Z probe");
 						gb.SetState(GCodeState::checkError);
 						RetractZProbe(gb, 29);
 						break;
 					}
-					zp->SetProbing(true);
 					moveBuffer.checkEndstops = true;
 					moveBuffer.reduceAcceleration = true;
 					moveBuffer.coords[Z_AXIS] = -zp->GetDiveHeight() + zp->GetActualTriggerHeight();
@@ -606,6 +645,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 				zp->SetProbing(false);
 				if (!zProbeTriggered)
 				{
+					reprap.GetMove().heightMapLock.ReleaseWriter();
 					gb.MachineState().SetError("Z probe was not triggered during probing move");
 					gb.SetState(GCodeState::checkError);
 					RetractZProbe(gb, 29);
@@ -678,6 +718,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 			}
 			else
 			{
+				reprap.GetMove().heightMapLock.ReleaseWriter();
 				gb.MachineState().SetError("Z probe readings not consistent");
 				gb.SetState(GCodeState::checkError);
 				RetractZProbe(gb, 29);
@@ -760,10 +801,11 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 			{
 				gb.MachineState().SetError("Too few points probed");
 			}
+			reprap.GetMove().heightMapLock.ReleaseWriter();
 		}
 		if (stateMachineResult == GCodeResult::ok)
 		{
-			reprap.GetPlatform().MessageF(LogMessage, "%s\n", reply.c_str());
+			reprap.GetPlatform().MessageF(LogWarn, "%s\n", reply.c_str());
 		}
 		gb.SetState(GCodeState::normal);
 		break;
@@ -814,7 +856,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 	case GCodeState::probingAtPoint2b:
 		if (LockMovementAndWaitForStandstill(gb))
 		{
-			// Head has finished moving to the correct XY position
+			// Head has finished moving to the correct XY position and BLTouch has been deployed
 			lastProbedTime = millis();								// start the probe recovery timer
 			if (platform.GetZProbeOrDefault(currentZProbeNumber)->GetTurnHeatersOff())
 			{
@@ -856,7 +898,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 				{
 					zProbeTriggered = false;
 					SetMoveBufferDefaults();
-					if (!platform.GetEndstops().EnableZProbe(currentZProbeNumber))
+					if (!platform.GetEndstops().EnableZProbe(currentZProbeNumber) || !zp->SetProbing(true))
 					{
 						gb.MachineState().SetError("Failed to enable Z probe");
 						gb.SetState(GCodeState::checkError);
@@ -864,7 +906,6 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 						break;
 					}
 
-					zp->SetProbing(true);
 					moveBuffer.checkEndstops = true;
 					moveBuffer.reduceAcceleration = true;
 					moveBuffer.coords[Z_AXIS] = (IsAxisHomed(Z_AXIS))
@@ -891,7 +932,8 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 			if (zp->GetProbeType() == ZProbeType::none)
 			{
 				// No Z probe, so we are doing manual mesh levelling. Take the current Z height as the height error.
-				g30zStoppedHeight = g30zHeightError = moveBuffer.coords[Z_AXIS];
+				g30zHeightError = moveBuffer.coords[Z_AXIS];
+				zp->SetLastStoppedHeight(g30zHeightError);
 			}
 			else
 			{
@@ -907,7 +949,8 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 					// Successful probing
 					float m[MaxAxes];
 					reprap.GetMove().GetCurrentMachinePosition(m, false);		// get height without bed compensation
-					g30zStoppedHeight = m[Z_AXIS] - g30HValue;					// save for later
+					const float g30zStoppedHeight = m[Z_AXIS] - g30HValue;					// save for later
+					zp->SetLastStoppedHeight(g30zStoppedHeight);
 					g30zHeightError = g30zStoppedHeight - zp->GetActualTriggerHeight();
 					g30zHeightErrorSum += g30zHeightError;
 				}
@@ -932,7 +975,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 
 					// Find the coordinates of the Z probe to pass to SetZeroHeightError
 					float tempCoords[MaxAxes];
-					memcpy(tempCoords, moveBuffer.coords, sizeof(tempCoords));
+					memcpyf(tempCoords, moveBuffer.coords, ARRAY_SIZE(tempCoords));
 					tempCoords[X_AXIS] += zp->GetXOffset();
 					tempCoords[Y_AXIS] += zp->GetYOffset();
 					reprap.GetMove().SetZeroHeightError(tempCoords);
@@ -1016,19 +1059,22 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 
 				// Find the coordinates of the Z probe to pass to SetZeroHeightError
 				float tempCoords[MaxAxes];
-				memcpy(tempCoords, moveBuffer.coords, sizeof(tempCoords));
+				memcpyf(tempCoords, moveBuffer.coords, ARRAY_SIZE(tempCoords));
 				tempCoords[X_AXIS] += zp->GetXOffset();
 				tempCoords[Y_AXIS] += zp->GetYOffset();
 				reprap.GetMove().SetZeroHeightError(tempCoords);
 				ToolOffsetInverseTransform(moveBuffer.coords, currentUserPosition);
 			}
 			gb.AdvanceState();
-			RetractZProbe(gb, 30);
+			if (zp->GetProbeType() != ZProbeType::blTouch)			// if it's a BLTouch then we have already retracted it
+			{
+				RetractZProbe(gb, 30);
+			}
 		}
 		break;
 
 	case GCodeState::probingAtPoint6:
-		// Here when we have finished probing with a P parameter and have retracted the probe if necessary
+		// Here when we have finished probing and have retracted the probe if necessary
 		if (LockMovementAndWaitForStandstill(gb))		// retracting the Z probe
 		{
 			if (g30SValue == 1)
@@ -1059,8 +1105,9 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 		if (g30SValue == -3)
 		{
 			// Adjust the Z probe trigger height to the stop height
-			platform.GetZProbeOrDefault(currentZProbeNumber)->SetTriggerHeight(g30zStoppedHeight);
-			reply.printf("Z probe trigger height set to %.3f mm", (double)g30zStoppedHeight);
+			const auto zp = platform.GetZProbeOrDefault(currentZProbeNumber);
+			zp->SetTriggerHeight(zp->GetLastStoppedHeight());
+			reply.printf("Z probe trigger height set to %.3f mm", (double)zp->GetLastStoppedHeight());
 		}
 		else if (g30SValue == -2)
 		{
@@ -1079,11 +1126,10 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 		else
 		{
 			// Just print the stop height
-			reply.printf("Stopped at height %.3f mm", (double)g30zStoppedHeight);
+			reply.printf("Stopped at height %.3f mm", (double)platform.GetZProbeOrDefault(currentZProbeNumber)->GetLastStoppedHeight());
 		}
 		gb.SetState(GCodeState::normal);
 		break;
-
 
 	case GCodeState::straightProbe0:			// ready to deploy the probe
 		if (LockMovementAndWaitForStandstill(gb))
@@ -1142,7 +1188,7 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 					{
 						zProbeTriggered = false;
 						SetMoveBufferDefaults();
-						if (!platform.GetEndstops().EnableZProbe(sps.GetZProbeToUse(), probingAway))
+						if (!platform.GetEndstops().EnableZProbe(sps.GetZProbeToUse(), probingAway) || !zp->SetProbing(true))
 						{
 							gb.MachineState().SetError("Failed to enable Z probe");
 							gb.SetState(GCodeState::checkError);
@@ -1150,7 +1196,6 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 							break;
 						}
 
-						zp->SetProbing(true);
 						moveBuffer.checkEndstops = true;
 						moveBuffer.reduceAcceleration = true;
 						sps.SetCoordsToTarget(moveBuffer.coords);
@@ -1280,17 +1325,30 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 		{
 			if (timingBytesWritten >= timingBytesRequested)
 			{
-				sdTimingFile->Close();
 				const uint32_t ms = millis() - timingStartMillis;
 				const float fileMbytes = (float)timingBytesWritten/(float)(1024 * 1024);
 				const float mbPerSec = (fileMbytes * 1000.0)/(float)ms;
-				reply.printf("SD write speed for %.1fMbyte file was %.2fMbytes/sec", (double)fileMbytes, (double)mbPerSec);
-				platform.Delete(platform.GetGCodeDir(), TimingFileName);
-				gb.SetState(GCodeState::normal);
+				platform.MessageF(gb.GetResponseMessageType(), "SD write speed for %.1fMbyte file was %.2fMbytes/sec\n", (double)fileMbytes, (double)mbPerSec);
+				sdTimingFile->Close();
+
+				sdTimingFile = platform.OpenFile(platform.GetGCodeDir(), TimingFileName, OpenMode::read);
+				if (sdTimingFile == nullptr)
+				{
+					platform.Delete(platform.GetGCodeDir(), TimingFileName);
+					gb.MachineState().SetError("Failed to re-open timing file");
+					gb.SetState(GCodeState::normal);
+					break;
+				}
+
+				platform.Message(gb.GetResponseMessageType(), "Testing SD card read speed...\n");
+				timingBytesWritten = 0;
+				timingStartMillis = millis();
+				gb.SetState(GCodeState::timingSDread);
 				break;
 			}
 
-			if (!sdTimingFile->Write(reply.c_str(), reply.Capacity()))
+			const unsigned int bytesToWrite = min<size_t>(reply.Capacity(), timingBytesRequested - timingBytesWritten);
+			if (!sdTimingFile->Write(reply.c_str(), bytesToWrite))
 			{
 				sdTimingFile->Close();
 				platform.Delete(platform.GetGCodeDir(), TimingFileName);
@@ -1298,21 +1356,44 @@ void GCodes::RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept
 				gb.SetState(GCodeState::normal);
 				break;
 			}
-			timingBytesWritten += reply.Capacity();
-			writtenThisTime += reply.Capacity();
+			timingBytesWritten += bytesToWrite;
+			writtenThisTime += bytesToWrite;
+		}
+		break;
+
+	case GCodeState::timingSDread:
+		for (uint32_t readThisTime = 0; readThisTime < 100 * 1024; )
+		{
+			if (timingBytesWritten >= timingBytesRequested)
+			{
+				const uint32_t ms = millis() - timingStartMillis;
+				const float fileMbytes = (float)timingBytesWritten/(float)(1024 * 1024);
+				const float mbPerSec = (fileMbytes * 1000.0)/(float)ms;
+				sdTimingFile->Close();
+				reply.printf("SD read speed for %.1fMbyte file was %.2fMbytes/sec", (double)fileMbytes, (double)mbPerSec);
+				platform.Delete(platform.GetGCodeDir(), TimingFileName);
+				gb.SetState(GCodeState::normal);
+				break;
+			}
+
+			const unsigned int bytesToRead = min<size_t>(reply.Capacity(), timingBytesRequested - timingBytesWritten);
+			if (sdTimingFile->Read(reply.Pointer(), bytesToRead) != (int)bytesToRead)
+			{
+				sdTimingFile->Close();
+				platform.Delete(platform.GetGCodeDir(), TimingFileName);
+				gb.MachineState().SetError("Failed to read from timing file");
+				gb.SetState(GCodeState::normal);
+				break;
+			}
+			timingBytesWritten += bytesToRead;
+			readThisTime += bytesToRead;
 		}
 		break;
 #endif
 
 #if HAS_LINUX_INTERFACE
-	case GCodeState::doingUnsupportedCode:
-		//TODO
-	case GCodeState::doingUserMacro:
-		// We get here when a macro file has been cancelled via M99 or M292 P1
-		gb.SetState(GCodeState::normal);
-		break;
+	case GCodeState::waitingForAcknowledgement:	// finished M291 and the SBC expects a response next
 #endif
-
 	case GCodeState::checkError:				// we return to this state after running the retractprobe macro when there may be a stored error message
 		gb.SetState(GCodeState::normal);
 		break;

@@ -10,24 +10,21 @@
 
 #include <limits>
 
-#if HAS_LINUX_INTERFACE
-static unsigned int LastFileId = 1;
-#endif
-
 // Create a default initialised GCodeMachineState
 GCodeMachineState::GCodeMachineState() noexcept
 	: feedRate(DefaultFeedRate * SecondsToMinutes),
 #if HAS_LINUX_INTERFACE
-	  fileId(0),
+	  fileId(NoFileId),
 #endif
 	  lineNumber(0),
-	  compatibility(Compatibility::RepRapFirmware), drivesRelative(false), axesRelative(false),
+	  drivesRelative(false), axesRelative(false),
 #if HAS_LINUX_INTERFACE
-	  isFileFinished(false), fileError(false),
+	  lastCodeFromSbc(false), macroStartedByCode(false), fileFinished(false),
 #endif
 	  doingFileMacro(false), waitWhileCooling(false), runningM501(false), runningM502(false),
 	  volumetricExtrusion(false), g53Active(false), runningSystemMacro(false), usingInches(false),
-	  waitingForAcknowledgement(false), messageAcknowledged(false), blockNesting(0),
+	  waitingForAcknowledgement(false), messageAcknowledged(false),
+	  compatibility(Compatibility::RepRapFirmware), blockNesting(0),
 	  previous(nullptr), errorMessage(nullptr),
 	  state(GCodeState::normal), stateMachineResult(GCodeResult::ok)
 {
@@ -45,13 +42,14 @@ GCodeMachineState::GCodeMachineState(GCodeMachineState& prev, bool withinSameFil
 #endif
 	  lockedResources(prev.lockedResources),
 	  lineNumber((withinSameFile) ? prev.lineNumber : 0),
-	  compatibility(prev.compatibility), drivesRelative(prev.drivesRelative), axesRelative(prev.axesRelative),
+	  drivesRelative(prev.drivesRelative), axesRelative(prev.axesRelative),
 #if HAS_LINUX_INTERFACE
-	  isFileFinished(prev.isFileFinished), fileError(false),
+	  lastCodeFromSbc(prev.lastCodeFromSbc), macroStartedByCode(prev.macroStartedByCode), fileFinished(prev.fileFinished),
 #endif
-	  doingFileMacro(prev.doingFileMacro), waitWhileCooling(prev.waitWhileCooling), runningM501(prev.runningM501),  runningM502(prev.runningM502),
+	  doingFileMacro(prev.doingFileMacro), waitWhileCooling(prev.waitWhileCooling), runningM501(prev.runningM501), runningM502(prev.runningM502),
 	  volumetricExtrusion(false), g53Active(false), runningSystemMacro(prev.runningSystemMacro), usingInches(prev.usingInches),
-	  waitingForAcknowledgement(false), messageAcknowledged(false), blockNesting((withinSameFile) ? prev.blockNesting : 0),
+	  waitingForAcknowledgement(false), messageAcknowledged(false),
+	  compatibility(prev.compatibility), blockNesting((withinSameFile) ? prev.blockNesting : 0),
 	  previous(&prev), errorMessage(nullptr),
 	  state(GCodeState::normal), stateMachineResult(GCodeResult::ok)
 {
@@ -71,12 +69,7 @@ GCodeMachineState::GCodeMachineState(GCodeMachineState& prev, bool withinSameFil
 GCodeMachineState::~GCodeMachineState() noexcept
 {
 #if HAS_MASS_STORAGE
-# if HAS_LINUX_INTERFACE
-	if (!reprap.UsingLinuxInterface())
-# endif
-	{
-		fileState.Close();
-	}
+	fileState.Close();
 #endif
 }
 
@@ -85,15 +78,18 @@ GCodeMachineState::~GCodeMachineState() noexcept
 // Set the state to indicate a file is being processed
 void GCodeMachineState::SetFileExecuting() noexcept
 {
-	fileId = LastFileId++;
-	isFileFinished = fileError = false;
-}
-
-// Mark the currently executing file as finished
-void GCodeMachineState::SetFileFinished(bool error) noexcept
-{
-	isFileFinished = true;
-	fileError = error;
+#if HAS_MASS_STORAGE
+	if (!fileState.IsLive())
+#endif
+	{
+		fileId = (GetPrevious() != nullptr ? GetPrevious()->fileId : NoFileId) + 1;
+		if (fileId == NoFileId)
+		{
+			// In case the ID overlapped increase it once more (should never happen)
+			fileId++;
+		}
+		fileFinished = false;
+	}
 }
 
 #endif
@@ -102,9 +98,9 @@ void GCodeMachineState::SetFileFinished(bool error) noexcept
 bool GCodeMachineState::DoingFile() const noexcept
 {
 #if HAS_LINUX_INTERFACE
-	if (reprap.UsingLinuxInterface())
+	if (reprap.UsingLinuxInterface() && fileId != NoFileId)
 	{
-		return fileId != 0;
+		return true;
 	}
 #endif
 #if HAS_MASS_STORAGE
@@ -118,14 +114,15 @@ bool GCodeMachineState::DoingFile() const noexcept
 void GCodeMachineState::CloseFile() noexcept
 {
 #if HAS_LINUX_INTERFACE
-	if (reprap.UsingLinuxInterface())
+	if (reprap.UsingLinuxInterface() && fileId != NoFileId)
 	{
-		for (GCodeMachineState *ms = this; ms != nullptr; ms = ms->previous)
+		const FileId lastFileId = fileId;
+		for (GCodeMachineState *ms = this; ms != nullptr; ms = ms->GetPrevious())
 		{
-			if (ms->fileId == fileId)
+			if (ms->fileId == lastFileId)
 			{
-				ms->isFileFinished = false;
-				ms->fileId = 0;
+				ms->fileId = NoFileId;
+				ms->fileFinished = false;
 			}
 		}
 	}
@@ -141,14 +138,13 @@ void GCodeMachineState::CloseFile() noexcept
 void GCodeMachineState::WaitForAcknowledgement() noexcept
 {
 	waitingForAcknowledgement = true;
-#if HAS_LINUX_INTERFACE
-	waitingForAcknowledgementSent = false;
-	if (!reprap.UsingLinuxInterface())
-#endif
+#if HAS_MASS_STORAGE
+	if (fileState.IsLive())
 	{
 		// Stop reading from the current file
 		CloseFile();
 	}
+#endif
 }
 
 void GCodeMachineState::CopyStateFrom(const GCodeMachineState& other) noexcept

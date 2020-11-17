@@ -41,9 +41,9 @@ const char feedrateLetter = 'F';						// GCode feedrate
 const char extrudeLetter = 'E'; 						// GCode extrude
 
 // Bits for T-code P-parameter to specify which macros are supposed to be run
-constexpr uint8_t TFreeBit = 1 << 0;
-constexpr uint8_t TPreBit = 1 << 1;
-constexpr uint8_t TPostBit = 1 << 2;
+constexpr uint8_t TFreeBit = 1u << 0;
+constexpr uint8_t TPreBit = 1u << 1;
+constexpr uint8_t TPostBit = 1u << 2;
 constexpr uint8_t DefaultToolChangeParam = TFreeBit | TPreBit | TPostBit;
 
 // Machine type enumeration. The numeric values must be in the same order as the corresponding M451..M453 commands.
@@ -61,7 +61,7 @@ enum class PauseReason
 	filamentChange,	// M600 command
 	trigger,		// external switch
 	heaterFault,	// heater fault detected
-	filament,		// filament monitor
+	filamentError,	// filament monitor
 #if HAS_SMART_DRIVERS
 	stall,			// motor stall detected
 #endif
@@ -76,6 +76,14 @@ enum class StopPrintReason
 	normalCompletion,
 	userCancelled,
 	abort
+};
+
+enum class PauseState : uint8_t
+{
+	notPaused = 0,
+	pausing,
+	paused,
+	resuming
 };
 
 //****************************************************************************************************
@@ -98,18 +106,19 @@ public:
 #if HAS_MASS_STORAGE
 	bool QueueFileToPrint(const char* fileName, const StringRef& reply) noexcept;	// Open a file of G Codes to run
 #endif
-	void StartPrinting(bool fromStart) noexcept;								// Start printing the file already selected
 	void AbortPrint(GCodeBuffer& gb) noexcept;									// Cancel any print in progress
 	void GetCurrentCoordinates(const StringRef& s) const noexcept;				// Write where we are into a string
-	bool DoingFileMacro() const noexcept;										// Or still busy processing a macro file?
+	bool DoingFileMacro() const noexcept;										// Is a macro file being processed?
+	bool WaitingForAcknowledgement() const noexcept;							// Is an input waiting for a message to be acknowledged?
+
 	FilePosition GetFilePosition() const noexcept;								// Return the current position of the file being printed in bytes
 	void Diagnostics(MessageType mtype) noexcept;								// Send helpful information out
 
 	bool RunConfigFile(const char* fileName) noexcept;							// Start running the config file
-	bool IsDaemonBusy() const noexcept;											// Return true if the daemon is busy running config.g or a trigger file
+	bool IsTriggerBusy() const noexcept;										// Return true if the trigger G-code buffer is busy running config.g or a trigger file
 
 	bool IsAxisHomed(unsigned int axis) const noexcept							// Has the axis been homed?
-		{ return axesHomed.IsBitSet(axis); }
+		{ return axesVirtuallyHomed.IsBitSet(axis); }
 	void SetAxisIsHomed(unsigned int axis) noexcept;							// Tell us that the axis is now homed
 	void SetAxisNotHomed(unsigned int axis) noexcept;							// Tell us that the axis is not homed
 	void SetAllAxesNotHomed() noexcept;											// Flag all axes as not homed
@@ -132,23 +141,21 @@ public:
 	NetworkGCodeInput *GetTelnetInput() const noexcept { return telnetInput; }
 #endif
 
+	PauseState GetPauseState() const noexcept { return pauseState; }
 	bool IsFlashing() const noexcept { return isFlashing; }						// Is a new firmware binary going to be flashed?
 
-	bool IsPaused() const noexcept;
-	bool IsPausing() const noexcept;
-	bool IsResuming() const noexcept;
-	bool IsRunning() const noexcept;
 	bool IsReallyPrinting() const noexcept;										// Return true if we are printing from SD card and not pausing, paused or resuming
+	bool IsReallyPrintingOrResuming() const noexcept;
 	bool IsSimulating() const noexcept { return simulationMode != 0; }
 	bool IsDoingToolChange() const noexcept { return doingToolChange; }
 	bool IsHeatingUp() const noexcept;											// Return true if the SD card print is waiting for a heater to reach temperature
+	bool IsRunningConfigFile() const noexcept { return runningConfigFile; }
+	bool SawM501InConfigFile() const noexcept { return m501SeenInConfigFile; }
 
 	uint32_t GetLastDuration() const noexcept { return lastDuration; }			// The most recent print time or simulated time
 	float GetSimulationTime() const noexcept { return simulationTime; }
 
 	bool AllAxesAreHomed() const noexcept;										// Return true if all axes are homed
-
-	void StopPrint(StopPrintReason reason) noexcept;							// Stop the current print
 
 	void MoveStoppedByZProbe() noexcept { zProbeTriggered = true; }				// Called from the step ISR when the Z probe is triggered, causing the move to be aborted
 
@@ -192,7 +199,7 @@ public:
 	bool AtxPowerControlled() const noexcept { return atxPowerControlled; }
 
 	const GridDefinition& GetDefaultGrid() const { return defaultGrid; };		// Get the default grid definition
-	void AssignGrid(float xRange[2], float yRange[2], float radius, float spacing[2]) noexcept;	// Assign the heightmap using the given parameters
+	bool AssignGrid(float xRange[2], float yRange[2], float radius, float spacing[2]) noexcept;	// Assign the heightmap using the given parameters
 	void ActivateHeightmap(bool activate) noexcept;								// (De-)Activate the height map
 
 	int GetNewToolNumber() const noexcept { return newToolNumber; }
@@ -208,7 +215,7 @@ public:
 
 	void SavePosition(RestorePoint& rp, const GCodeBuffer& gb) const noexcept;		// Save position etc. to a restore point
 	void SaveSpindleSpeeds(RestorePoint& rp) const noexcept;						// Save spindle speeds to a restore point
-	void StartToolChange(GCodeBuffer& gb, int toolNum, uint8_t toolChangeParam) noexcept;
+	void StartToolChange(GCodeBuffer& gb, int toolNum, uint8_t param) noexcept;
 
 	unsigned int GetWorkplaceCoordinateSystemNumber() const noexcept { return currentCoordinateSystem + 1; }
 
@@ -249,6 +256,7 @@ public:
 	// Standard macro filenames
 #define DEPLOYPROBE		"deployprobe"
 #define RETRACTPROBE	"retractprobe"
+#define FILAMENT_ERROR	"filament-error"
 #define TPRE			"tpre"
 #define TPOST			"tpost"
 #define TFREE			"tfree"
@@ -256,6 +264,7 @@ public:
 	static constexpr const char* CONFIG_FILE = "config.g";
 	static constexpr const char* CONFIG_BACKUP_FILE = "config.g.bak";
 	static constexpr const char* BED_EQUATION_G = "bed.g";
+	static constexpr const char* MESH_G = "mesh.g";
 	static constexpr const char* PAUSE_G = "pause.g";
 	static constexpr const char* RESUME_G = "resume.g";
 	static constexpr const char* CANCEL_G = "cancel.g";
@@ -299,13 +308,17 @@ private:
 	void UnlockResource(const GCodeBuffer& gb, Resource r) noexcept;			// Unlock the resource if we own it
 	void UnlockMovement(const GCodeBuffer& gb) noexcept;						// Unlock the movement resource if we own it
 
-	void StartNextGCode(GCodeBuffer& gb, const StringRef& reply) noexcept;		// Fetch a new or old GCode and process it
+	bool SpinGCodeBuffer(GCodeBuffer& gb) noexcept;								// Do some work on an input channel
+	bool StartNextGCode(GCodeBuffer& gb, const StringRef& reply) noexcept;		// Fetch a new or old GCode and process it
 	void RunStateMachine(GCodeBuffer& gb, const StringRef& reply) noexcept;		// Execute a step of the state machine
 	void DoStraightManualProbe(GCodeBuffer& gb, const StraightProbeSettings& sps);
 
-	void DoFilePrint(GCodeBuffer& gb, const StringRef& reply) noexcept;					// Get G Codes from a file and print them
+	void StartPrinting(bool fromStart) noexcept;								// Start printing the file already selected
+	void StopPrint(StopPrintReason reason) noexcept;							// Stop the current print
+
+	bool DoFilePrint(GCodeBuffer& gb, const StringRef& reply) noexcept;			// Get G Codes from a file and print them
 	bool DoFileMacro(GCodeBuffer& gb, const char* fileName, bool reportMissing, int codeRunning = -1) noexcept;
-		// Run a GCode macro file, optionally report error if not found
+																						// Run a GCode macro file, optionally report error if not found
 	void FileMacroCyclesReturn(GCodeBuffer& gb) noexcept;								// End a macro
 
 	bool ActOnCode(GCodeBuffer& gb, const StringRef& reply) noexcept;					// Do a G, M or T Code
@@ -375,13 +388,13 @@ private:
 	GCodeResult RetractFilament(GCodeBuffer& gb, bool retract);					// Retract or un-retract filaments
 	GCodeResult LoadFilament(GCodeBuffer& gb, const StringRef& reply);			// Load the specified filament into a tool
 	GCodeResult UnloadFilament(GCodeBuffer& gb, const StringRef& reply);		// Unload the current filament from a tool
-	bool ChangeMicrostepping(size_t drive, unsigned int microsteps, bool interp, const StringRef& reply) const noexcept; // Change microstepping on the specified drive
+	bool ChangeMicrostepping(size_t axisOrExtruder, unsigned int microsteps, bool interp, const StringRef& reply) const noexcept; // Change microstepping on the specified drive
 	void CheckTriggers() noexcept;												// Check for and execute triggers
 	void CheckFilament() noexcept;												// Check for and respond to filament errors
 	void CheckHeaterFault() noexcept;											// Check for and respond to a heater fault, returning true if we should exit
 	void DoEmergencyStop() noexcept;											// Execute an emergency stop
 
-	void DoPause(GCodeBuffer& gb, PauseReason reason, const char *msg) noexcept	// Pause the print
+	void DoPause(GCodeBuffer& gb, PauseReason reason, const char *msg, uint16_t param = 0) noexcept	// Pause the print
 		pre(resourceOwners[movementResource] = &gb);
 	void CheckForDeferredPause(GCodeBuffer& gb) noexcept;						// Check if a pause is pending, action it if so
 
@@ -392,7 +405,7 @@ private:
 	bool IsMappedFan(unsigned int fanNumber) noexcept;							// Return true if this fan number is currently being used as a print cooling fan
 	void SaveFanSpeeds() noexcept;												// Save the speeds of all fans
 
-	GCodeResult DefineGrid(GCodeBuffer& gb, const StringRef &reply);			// Define the probing grid, returning true if error
+	GCodeResult DefineGrid(GCodeBuffer& gb, const StringRef &reply) THROWS(GCodeException);	// Define the probing grid, returning true if error
 #if HAS_MASS_STORAGE
 	GCodeResult LoadHeightMap(GCodeBuffer& gb, const StringRef& reply);			// Load the height map from file
 	bool TrySaveHeightMap(const char *filename, const StringRef& reply) const noexcept;	// Save the height map to the specified file
@@ -449,14 +462,16 @@ private:
 #endif
 	Pwm_t ConvertLaserPwm(float reqVal) const noexcept;
 
-#ifdef SERIAL_AUX_DEVICE
+	bool CheckNetworkCommandAllowed(GCodeBuffer& gb, const StringRef& reply, GCodeResult& result) noexcept;
+
+#if HAS_AUX_DEVICES
 	static bool emergencyStopCommanded;
 	static void CommandEmergencyStop(UARTClass *p) noexcept;
 #endif
 
 	Platform& platform;													// The RepRap machine
 
-#if HAS_NETWORKING
+#if HAS_NETWORKING || HAS_LINUX_INTERFACE
 	NetworkGCodeInput* httpInput;										// These cache incoming G-codes...
 	NetworkGCodeInput* telnetInput;										// ...
 #endif
@@ -478,6 +493,7 @@ private:
 
 	size_t nextGcodeSource;												// The one to check next, using round-robin scheduling
 
+	static Mutex resourceMutex;
 	const GCodeBuffer* resourceOwners[NumResources];					// Which gcode buffer owns each resource
 
 	MachineType machineType;					// whether FFF, laser or CNC
@@ -485,7 +501,7 @@ private:
 #if HAS_LINUX_INTERFACE
 	FilePosition lastFilePosition;				// Last known file position
 #endif
-	bool isPaused;								// true if the print has been paused manually or automatically
+	PauseState pauseState;						// whether the machine is running normally or is pausing, paused or resuming
 	bool pausePending;							// true if we have been asked to pause but we are running a macro
 	bool filamentChangePausePending;			// true if we have been asked to pause for a filament change but we are running a macro
 	bool runningConfigFile;						// We are running config.g during the startup process
@@ -508,6 +524,7 @@ private:
 	RawMove moveBuffer;							// Move details to pass to Move class
 	unsigned int segmentsLeft;					// The number of segments left to do in the current move, or 0 if no move available
 	unsigned int totalSegments;					// The total number of segments left in the complete move
+	bool updateUserPosition;
 
 	unsigned int segmentsLeftToStartAt;
 	float moveFractionToSkip;
@@ -531,7 +548,6 @@ private:
 	};
 	SegmentedMoveState segMoveState;
 
-	AxesBitmap axesHomedBeforeSimulation;		// axes that were homed when we started the simulation
 	RestorePoint simulationRestorePoint;		// The position and feed rate when we started a simulation
 
 	RestorePoint numberedRestorePoints[NumRestorePoints];				// Restore points accessible using the R parameter in the G0/G1 command
@@ -565,6 +581,7 @@ private:
 
 	AxesBitmap toBeHomed;						// Bitmap of axes still to be homed
 	AxesBitmap axesHomed;						// Bitmap of which axes have been homed
+	AxesBitmap axesVirtuallyHomed;				// same as axesHomed except all bits are set when simulating
 
 	float pausedFanSpeeds[MaxFans];				// Fan speeds when the print was paused or a tool change started
 	float lastDefaultFanSpeed;					// Last speed given in a M106 command with on fan number
@@ -579,7 +596,6 @@ private:
 	int32_t g30ProbePointIndex;					// the index of the point we are probing (G30 P parameter), or -1 if none
 	int g30SValue;								// S parameter in the G30 command, or -2 if there wasn't one
 	float g30HValue;							// H parameter in the G30 command, or 0.0 if there wasn't on
-	float g30zStoppedHeight;					// the height to report after running G30 S-1
 	float g30zHeightError;						// the height error last time we probed
 	float g30PrevHeightError;					// the height error the previous time we probed
 	float g30zHeightErrorSum;					// the sum of the height errors for the current probe point
@@ -657,6 +673,8 @@ private:
 	char filamentToLoad[FilamentNameLength];	// Name of the filament being loaded
 
 	static constexpr const float MinServoPulseWidth = 544.0, MaxServoPulseWidth = 2400.0;
+
+	static constexpr int8_t ObjectModelAuxStatusReportType = 100;		// A non-negative value distinct from any M408 report type
 };
 
 // Flag that a new move is available for consumption by the Move subsystem

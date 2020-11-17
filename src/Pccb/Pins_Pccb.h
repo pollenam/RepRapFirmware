@@ -113,7 +113,7 @@ constexpr unsigned int MaxTriggers = 16;			// Maximum number of triggers
 
 constexpr size_t MaxSpindles = 2;					// Maximum number of configurable spindles
 
-constexpr size_t NUM_SERIAL_CHANNELS = 1;			// The number of serial IO channels (USB only)
+constexpr size_t NumSerialChannels = 1;				// The number of serial IO channels (USB only)
 #define SERIAL_MAIN_DEVICE SerialUSB
 
 // SerialUSB
@@ -188,17 +188,11 @@ constexpr Pin TEMP_SENSE_PINS[NumThermistorInputs] = { PortAPin(20), PortCPin(13
 constexpr Pin VssaSensePin = PortAPin(19);
 constexpr Pin VrefSensePin = PortBPin(1);
 
-// Default thermistor parameters - on PCCB we default both thermistors to the same parameters
-constexpr float BED_R25 = 100000.0;
-constexpr float BED_BETA = 4388.0;
-constexpr float BED_SHC = 0.0;
-constexpr float EXT_R25 = 100000.0;
-constexpr float EXT_BETA = 4388.0;
-constexpr float EXT_SHC = 0.0;
-
 // Thermistor series resistor value in Ohms
 constexpr float DefaultThermistorSeriesR = 2200.0;
-constexpr float MinVrefLoadR = DefaultThermistorSeriesR / 2;		// there are 2 temperature sensing channels
+constexpr float MinVrefLoadR = (DefaultThermistorSeriesR / NumThermistorInputs) * 4700.0/((DefaultThermistorSeriesR / NumThermistorInputs) + 4700.0);
+																			// there are 2 temperature sensing channels and a 4K7 load resistor
+constexpr float VrefSeriesR = 15.0;
 
 // Number of SPI temperature sensors to support
 constexpr size_t MaxSpiTempSensors = 1;		//TODO which SPI channels does PCCB route to the DueX?
@@ -217,6 +211,7 @@ constexpr float PowerMonitorVoltageRange = 11.0 * 3.3;						// We use an 11:1 vo
 constexpr size_t MaxZProbes = 1;
 
 constexpr Pin DiagPin = NoPin;
+constexpr bool DiagOnPolarity = true;
 
 // DotStar LED control (USART0 is SharedSPI so we use USART1)
 #define DOTSTAR_USES_USART	1
@@ -232,7 +227,13 @@ constexpr size_t NumSdCards = 1;
 constexpr Pin SdCardDetectPins[NumSdCards] = { PortCPin(8) };
 constexpr Pin SdWriteProtectPins[NumSdCards] = { NoPin };
 constexpr Pin SdSpiCSPins[1] = { NoPin };
+constexpr IRQn SdhcIRQn = HSMCI_IRQn;
 constexpr uint32_t ExpectedSdCardSpeed = 15000000;
+
+// Shared SPI definitions
+#define USART_SPI		1
+#define USART_SSPI		USART0
+#define ID_SSPI			ID_USART0
 
 // Enum to represent allowed types of pin access
 // We don't have a separate bit for servo, because Duet PWM-capable ports can be used for servos if they are on the Duet main board
@@ -344,10 +345,10 @@ constexpr const char *DefaultGpioPinNames[] = { "led", "leddim" };
 
 #if defined(PCCB_10)
 constexpr const char *DefaultFanPinNames[] = { "fan0", "fan1", "fan2", "fan3", "fan4", "!fan5+fan5a.tach", "nil+fan5b.tach" };
-constexpr PwmFrequency DefaultFanPwmFrequencies[] = { DefaultFanPwmFreq, DefaultFanPwmFreq, DefaultFanPwmFreq, DefaultFanPwmFreq, DefaultFanPwmFreq, 25000 };
+constexpr PwmFrequency DefaultFanPwmFrequencies[] = { 0, 0, 0, 0, 0, 25000 };
 #else
 constexpr const char *DefaultFanPinNames[] = { "fan0", "fan1", "fan2", "!fan3+fan3a.tach", "nil+fan3btach" };
-constexpr PwmFrequency DefaultFanPwmFrequencies[] = { DefaultFanPwmFreq, DefaultFanPwmFreq, DefaultFanPwmFreq, 25000 };
+constexpr PwmFrequency DefaultFanPwmFrequencies[] = { 0, 0, 0, 25000 };
 #endif
 
 #endif
@@ -379,20 +380,16 @@ namespace StepPins
 				: 0;
 	}
 
-	// Set the specified step pins high
-	// This needs to be as fast as possible, so we do a parallel write to the port(s).
-	// We rely on only those port bits that are step pins being set in the PIO_OWSR register of each port
-	static inline void StepDriversHigh(uint32_t driverMap) noexcept
+	// Set the specified step pins high. This needs to be fast.
+	static inline __attribute__((always_inline)) void StepDriversHigh(uint32_t driverMap) noexcept
 	{
-		PIOC->PIO_ODSR = driverMap;				// on PCCB all step pins are on port C
+		PIOC->PIO_SODR = driverMap;				// on PCCB all step pins are on port C
 	}
 
-	// Set all step pins low
-	// This needs to be as fast as possible, so we do a parallel write to the port(s).
-	// We rely on only those port bits that are step pins being set in the PIO_OWSR register of each port
-	static inline void StepDriversLow() noexcept
+	// Set all step pins low. This needs to be fast.
+	static inline __attribute__((always_inline)) void StepDriversLow(uint32_t driverMap) noexcept
 	{
-		PIOC->PIO_ODSR = 0;						// on PCCB all step pins are on port C
+		PIOC->PIO_CODR = driverMap;				// on PCCB all step pins are on port C
 	}
 }
 

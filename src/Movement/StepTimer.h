@@ -59,7 +59,7 @@ public:
 	// ISR called from StepTimer
 	static void Interrupt() noexcept;
 
-#if SAME70
+#if SAME70 || SAME5x
 	static constexpr uint32_t StepClockRate = 48000000/64;						// 750kHz
 #elif defined(__LPC17xx__)
 	static constexpr uint32_t StepClockRate = 1000000;                          // 1MHz
@@ -86,9 +86,15 @@ private:
 // Function GetTimerTicks() is quite long for SAM4S and SAME70 processors, so it is moved to StepTimer.cpp and no longer inlined
 #if !(SAM4S || SAME70)
 
-inline StepTimer::Ticks StepTimer::GetTimerTicks() noexcept
+inline __attribute__((always_inline)) StepTimer::Ticks StepTimer::GetTimerTicks() noexcept
 {
-# ifdef __LPC17xx__
+# if SAME5x
+	StepTc->CTRLBSET.reg = TC_CTRLBSET_CMD_READSYNC;
+	// On the EXP3HC board it isn't enough just to wait for SYNCBUSY.COUNT here
+	while (StepTc->CTRLBSET.bit.CMD != 0) { }
+	while (StepTc->SYNCBUSY.bit.COUNT) { }
+	return StepTc->COUNT.reg;
+# elif defined(__LPC17xx__)
 	return STEP_TC->TC;
 # else
 	return STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_CV;
@@ -97,9 +103,11 @@ inline StepTimer::Ticks StepTimer::GetTimerTicks() noexcept
 
 #endif
 
-inline uint16_t StepTimer::GetTimerTicks16() noexcept
+inline __attribute__((always_inline)) uint16_t StepTimer::GetTimerTicks16() noexcept
 {
-#ifdef __LPC17xx__
+#if SAME5x
+	return (uint16_t)GetTimerTicks();
+#elif defined(__LPC17xx__)
 	return (uint16_t)STEP_TC->TC;
 #else
 	return (uint16_t)STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_CV;

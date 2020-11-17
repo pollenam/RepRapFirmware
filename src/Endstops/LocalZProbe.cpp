@@ -11,6 +11,11 @@
 #include "RepRap.h"
 #include "Platform.h"
 
+#if SAME5x
+# include <AnalogIn.h>
+using AnalogIn::AdcBits;
+#endif
+
 // Members of class LocalZProbe
 LocalZProbe::~LocalZProbe() noexcept
 {
@@ -97,14 +102,14 @@ uint16_t LocalZProbe::GetRawReading() const noexcept
 	case ZProbeType::digital:
 	case ZProbeType::unfilteredDigital:
 	case ZProbeType::blTouch:
-		return (inputPort.Read()) ? MaxReading : 0;
+		return (inputPort.ReadDigital()) ? MaxReading : 0;
 
 	default:
 		return MaxReading;
 	}
 }
 
-void LocalZProbe::SetProbing(bool isProbing) noexcept
+bool LocalZProbe::SetProbing(bool isProbing) noexcept
 {
 	// For Z probe types other than 1/2/3 and bltouch we set the modulation pin high at the start of a probing move and low at the end
 	// Don't do this for bltouch because on the Maestro, the MOD pin is normally used as the servo control output
@@ -112,6 +117,7 @@ void LocalZProbe::SetProbing(bool isProbing) noexcept
 	{
 		modulationPort.WriteDigital(isProbing);
 	}
+	return true;
 }
 
 GCodeResult LocalZProbe::AppendPinNames(const StringRef& str) noexcept

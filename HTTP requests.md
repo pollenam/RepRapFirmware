@@ -57,6 +57,8 @@ Officially supported board types are:
 | duetwifi102 | Duet WiFi v1.02 ||
 | duetethernet10 | Duet Ethernet v1.0 ||
 | duetethernet102 | Duet Ethernet v1.02 ||
+| duet2sbc10 | Duet 2 v1.0 + SBC ||
+| duet2sbc102 | Duet 2 v1.02 + SBC ||
 | duetmaestro100 | Duet Maestro v1.0 ||
 | duet3mb6hc | Duet 3 v0.6 ||
 
@@ -92,7 +94,7 @@ See [JSON responses](JSON%20Responses.md) for further information.
 
 ## Get /rr_config
 
-Retrieve the configuration response. This request provides a JSON object with values that are expected to change rarely. 
+Retrieve the configuration response. This request provides a JSON object with values that are expected to change rarely.
 
 See [JSON responses](JSON%20Responses.md) for further information.
 

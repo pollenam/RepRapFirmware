@@ -16,6 +16,7 @@
 #include <GCodes/GCodeChannel.h>
 #include "LinuxMessageFormats.h"
 #include <MessageType.h>
+#include <RTOSIface/RTOSIface.h>
 
 class BinaryGCodeBuffer;
 class StringRef;
@@ -30,6 +31,7 @@ class DataTransfer
 public:
 	DataTransfer() noexcept;
 	void Init() noexcept;
+	void SetLinuxTask(TaskHandle handle) noexcept;
 	void Diagnostics(MessageType mtype) noexcept;
 
 	bool IsConnected() const noexcept;														// Check if the connection to DCS is live
@@ -44,7 +46,7 @@ public:
 	void ReadPrintStartedInfo(size_t packetLength, StringRef& filename, GCodeFileInfo &info) noexcept;	// Read info about the started file print
 	PrintStoppedReason ReadPrintStoppedInfo() noexcept;										// Read info about why the print has been stopped
 	GCodeChannel ReadMacroCompleteInfo(bool &error) noexcept;								// Read info about a completed macro file
-	void ReadHeightMap() noexcept;															// Read heightmap parameters
+	bool ReadHeightMap() noexcept;															// Read heightmap parameters
 	GCodeChannel ReadCodeChannel() noexcept;												// Read a code channel
 	void ReadAssignFilament(int& extruder, StringRef& filamentName) noexcept;				// Read a request to assign the given filament to an extruder drive
 	void ReadFileChunk(char *buffer, int32_t& dataLength, uint32_t& fileLength) noexcept;	// Read another chunk of a file
@@ -55,8 +57,9 @@ public:
 	bool WriteObjectModel(OutputBuffer *data) noexcept;
 	bool WriteCodeBufferUpdate(uint16_t bufferSpace) noexcept;
 	bool WriteCodeReply(MessageType type, OutputBuffer *&response) noexcept;
-	bool WriteMacroRequest(GCodeChannel channel, const char *filename, bool reportMissing, bool fromBinaryCode) noexcept;
+	bool WriteMacroRequest(GCodeChannel channel, const char *filename, bool fromCode) noexcept;
 	bool WriteAbortFileRequest(GCodeChannel channel, bool abortAll) noexcept;
+	bool WriteMacroFileClosed(GCodeChannel channel) noexcept;
 	bool WritePrintPaused(FilePosition position, PrintPausedReason reason) noexcept;
 	bool WriteHeightMap() noexcept;
 	bool WriteLocked(GCodeChannel channel) noexcept;
@@ -65,8 +68,7 @@ public:
 	bool WriteEvaluationError(const char *expression, const char *errorMessage) noexcept;
 	bool WriteDoCode(GCodeChannel channel, const char *code, size_t length) noexcept;
 	bool WriteWaitForAcknowledgement(GCodeChannel channel) noexcept;
-
-	static void SpiInterrupt() noexcept;
+	bool WriteMessageAcknowledged(GCodeChannel channel) noexcept;
 
 private:
 	enum class SpiState
@@ -85,17 +87,27 @@ private:
 	unsigned int failedTransfers;
 
 	// Transfer buffers
-	// These must be in non-cached memory because we DMA to/from them, see http://ww1.microchip.com/downloads/en/DeviceDoc/Managing-Cache-Coherency-on-Cortex-M7-Based-MCUs-DS90003195A.pdf
+
+#if SAME70
+	// SAME70 has a write-back cache, so these must be in non-cached memory because we DMA to/from them.
+	// See http://ww1.microchip.com/downloads/en/DeviceDoc/Managing-Cache-Coherency-on-Cortex-M7-Based-MCUs-DS90003195A.pdf
 	// This in turn means that we must declare them static, so we can only have one DataTransfer instance
 	static __nocache TransferHeader rxHeader;
 	static __nocache TransferHeader txHeader;
 	static __nocache uint32_t rxResponse;
 	static __nocache uint32_t txResponse;
-	static __nocache uint32_t rxBuffer32[LinuxTransferBufferSize / 4];
-	static __nocache uint32_t txBuffer32[LinuxTransferBufferSize / 4];
-
-	static inline char * rxBuffer() { return reinterpret_cast<char *>(rxBuffer32); }
-	static inline char * txBuffer() { return reinterpret_cast<char *>(txBuffer32); }
+	alignas(4) static __nocache char rxBuffer[LinuxTransferBufferSize];
+	alignas(4) static __nocache char txBuffer[LinuxTransferBufferSize];
+#else
+	// The other processors we support have write-through cache
+	// Allocate the buffers in the object so that we can delete the object and recycle the memory if the SBC interface is not being used
+	TransferHeader rxHeader;
+	TransferHeader txHeader;
+	uint32_t rxResponse;
+	uint32_t txResponse;
+	char *rxBuffer;				// not allocated until we know we need it
+	char *txBuffer;				// not allocated until we know we need it
+#endif
 
 	size_t rxPointer, txPointer;
 

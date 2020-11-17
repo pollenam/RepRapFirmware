@@ -62,6 +62,7 @@ GCodeQueue::GCodeQueue() noexcept : freeItems(nullptr), queuedItems(nullptr)
 				case 140:	// set bed temperature and return immediately
 				case 141:	// set chamber temperature and return immediately
 				case 144:	// bed standby
+				case 150:	// set LED colours
 				case 117:	// display message
 				case 280:	// set servo
 				case 300:	// beep
@@ -96,7 +97,9 @@ GCodeQueue::GCodeQueue() noexcept : freeItems(nullptr), queuedItems(nullptr)
 bool GCodeQueue::QueueCode(GCodeBuffer &gb, uint32_t scheduleAt) noexcept
 {
 	// Can we queue this code somewhere?
-	if (freeItems == nullptr || gb.DataLength() > BufferSizePerQueueItem)
+	if (freeItems == nullptr || gb.DataLength() > BufferSizePerQueueItem
+		|| gb.ContainsExpression()						// if it contains an expression then the expression value may change or refer to 'iterations'
+	   )
 	{
 		return false;
 	}
@@ -244,10 +247,16 @@ void QueuedCode::AssignFrom(GCodeBuffer &gb) noexcept
 void QueuedCode::AssignTo(GCodeBuffer *gb) noexcept
 {
 #if HAS_LINUX_INTERFACE
-	gb->PutAndDecode(data, dataLength, isBinary);
-#else
-	gb->PutAndDecode(data, dataLength);
+	if (isBinary)
+	{
+		// Note that the data has to remain on a 4-byte boundary for this to work
+		gb->PutBinary(reinterpret_cast<const uint32_t *>(data), dataLength / sizeof(uint32_t));
+	}
+	else
 #endif
+	{
+		gb->PutAndDecode(data, dataLength);
+	}
 }
 
 // End

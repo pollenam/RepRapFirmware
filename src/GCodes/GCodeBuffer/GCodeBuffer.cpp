@@ -11,6 +11,9 @@
 #if HAS_MASS_STORAGE
 # include <GCodes/GCodeInput.h>
 #endif
+#if HAS_LINUX_INTERFACE
+# include <Linux/LinuxInterface.h>
+#endif
 #include "BinaryParser.h"
 #include "StringParser.h"
 #include <GCodes/GCodeException.h>
@@ -18,16 +21,17 @@
 #include <Platform.h>
 
 // Macros to reduce the amount of explicit conditional compilation in this file
-
 #if HAS_LINUX_INTERFACE
 
 # define PARSER_OPERATION(_x)	((isBinaryBuffer) ? (binaryParser._x) : (stringParser._x))
+# define BINARY_OR(_x)			((isBinaryBuffer) || (_x))
 # define NOT_BINARY_AND(_x)		((!isBinaryBuffer) && (_x))
 # define IF_NOT_BINARY(_x)		{ if (!isBinaryBuffer) { _x; } }
 
 #else
 
 # define PARSER_OPERATION(_x)	(stringParser._x)
+# define BINARY_OR(_x)			(_x)
 # define NOT_BINARY_AND(_x)		(_x)
 # define IF_NOT_BINARY(_x)		{ _x; }
 
@@ -91,12 +95,16 @@ GCodeBuffer::GCodeBuffer(GCodeChannel::RawType channel, GCodeInput *normalIn, Fi
 	  binaryParser(*this),
 #endif
 	  stringParser(*this),
-	  machineState(new GCodeMachineState()),
+	  machineState(new GCodeMachineState()), whenReportDueTimerStarted(millis()),
 #if HAS_LINUX_INTERFACE
 	  isBinaryBuffer(false),
 #endif
 	  timerRunning(false), motionCommanded(false)
+#if HAS_LINUX_INTERFACE
+	  , isWaitingForMacro(false), invalidated(false)
+#endif
 {
+	mutex.Create(((GCodeChannel)channel).ToString());
 	machineState->compatibility = c;
 	Reset();
 }
@@ -104,11 +112,21 @@ GCodeBuffer::GCodeBuffer(GCodeChannel::RawType channel, GCodeInput *normalIn, Fi
 // Reset it to its state after start-up
 void GCodeBuffer::Reset() noexcept
 {
-	while (PopState(false)) { }
 #if HAS_LINUX_INTERFACE
-	requestedMacroFile.Clear();
-	reportMissingMacro = isMacroFromCode = macroRequested = abortFile = abortAllFiles = false;
+	if (isWaitingForMacro)
+	{
+		ResolveMacroRequest(true, false);
+	}
+#endif
+
+	while (PopState(false)) { }
+
+#if HAS_LINUX_INTERFACE
 	isBinaryBuffer = false;
+	requestedMacroFile.Clear();
+	isWaitingForMacro = macroFileClosed = false;
+	macroJustStarted = macroFileError = macroFileEmpty = abortFile = abortAllFiles = sendToSbc = messagePromptPending = messageAcknowledged = false;
+	machineState->lastCodeFromSbc = machineState->macroStartedByCode = false;
 #endif
 	Init();
 }
@@ -148,6 +166,20 @@ bool GCodeBuffer::DoDwellTime(uint32_t dwellMillis) noexcept
 
 	// New dwell - set it up
 	StartTimer();
+	return false;
+}
+
+// Delay executing this GCodeBuffer for the specified time. Return true when the timer has expired.
+bool GCodeBuffer::IsReportDue() noexcept
+{
+	const uint32_t now = millis();
+
+	// Are we due?
+	if (now - whenReportDueTimerStarted >= reportDueInterval)
+	{
+		ResetReportDueTimer();
+		return true;
+	}
 	return false;
 }
 
@@ -202,6 +234,7 @@ void GCodeBuffer::Diagnostics(MessageType mtype) noexcept
 bool GCodeBuffer::Put(char c) noexcept
 {
 #if HAS_LINUX_INTERFACE
+	machineState->lastCodeFromSbc = false;
 	isBinaryBuffer = false;
 #endif
 	return stringParser.Put(c);
@@ -210,7 +243,7 @@ bool GCodeBuffer::Put(char c) noexcept
 // Decode the command in the buffer when it is complete
 void GCodeBuffer::DecodeCommand() noexcept
 {
-	IF_NOT_BINARY(stringParser.DecodeCommand());
+	PARSER_OPERATION(DecodeCommand());
 }
 
 // Check whether the current command is a meta command, or we are skipping a block. Return true if we are and the current line no longer needs to be processed.
@@ -219,35 +252,35 @@ bool GCodeBuffer::CheckMetaCommand(const StringRef& reply)
 	return NOT_BINARY_AND(stringParser.CheckMetaCommand(reply));
 }
 
-// Add an entire G-Code, overwriting any existing content
 #if HAS_LINUX_INTERFACE
 
-void GCodeBuffer::PutAndDecode(const char *str, size_t len, bool isBinary) noexcept
+// Add an entire binary G-Code, overwriting any existing content
+// CAUTION! This may be called with the task scheduler suspended, so don't do anything that might block or take more than a few microseconds to execute
+void GCodeBuffer::PutBinary(const uint32_t *data, size_t len) noexcept
 {
-	isBinaryBuffer = isBinary;
-	if (isBinary)
-	{
-		binaryParser.Put(str, len);
-	}
-	else
-	{
-		stringParser.PutAndDecode(str, len);
-	}
-}
-
-#else
-
-void GCodeBuffer::PutAndDecode(const char *str, size_t len) noexcept
-{
-	stringParser.PutAndDecode(str, len);
+	machineState->lastCodeFromSbc = true;
+	isBinaryBuffer = true;
+	macroJustStarted = false;
+	binaryParser.Put(data, len);
 }
 
 #endif
+
+// Add an entire G-Code, overwriting any existing content
+void GCodeBuffer::PutAndDecode(const char *str, size_t len) noexcept
+{
+#if HAS_LINUX_INTERFACE
+	machineState->lastCodeFromSbc = false;
+	isBinaryBuffer = false;
+#endif
+	stringParser.PutAndDecode(str, len);
+}
 
 // Add a null-terminated string, overwriting any existing content
 void GCodeBuffer::PutAndDecode(const char *str) noexcept
 {
 #if HAS_LINUX_INTERFACE
+	machineState->lastCodeFromSbc = false;
 	isBinaryBuffer = false;
 #endif
 	stringParser.PutAndDecode(str);
@@ -255,6 +288,9 @@ void GCodeBuffer::PutAndDecode(const char *str) noexcept
 
 void GCodeBuffer::StartNewFile() noexcept
 {
+#if HAS_LINUX_INTERFACE
+	machineState->SetFileExecuting();
+#endif
 	machineState->lineNumber = 0;						// reset line numbering when M32 is run
 	IF_NOT_BINARY(stringParser.StartNewFile());
 }
@@ -290,6 +326,11 @@ int8_t GCodeBuffer::GetCommandFraction() const noexcept
 	return PARSER_OPERATION(GetCommandFraction());
 }
 
+bool GCodeBuffer::ContainsExpression() const noexcept
+{
+	return PARSER_OPERATION(ContainsExpression());
+}
+
 // Is a character present?
 bool GCodeBuffer::Seen(char c) noexcept
 {
@@ -297,7 +338,7 @@ bool GCodeBuffer::Seen(char c) noexcept
 }
 
 // Test for character present, throw error if not
-void GCodeBuffer::MustSee(char c)
+void GCodeBuffer::MustSee(char c) THROWS(GCodeException)
 {
 	if (!Seen(c))
 	{
@@ -306,19 +347,19 @@ void GCodeBuffer::MustSee(char c)
 }
 
 // Get a float after a key letter
-float GCodeBuffer::GetFValue()
+float GCodeBuffer::GetFValue() THROWS(GCodeException)
 {
 	return PARSER_OPERATION(GetFValue());
 }
 
 // Get a distance or coordinate and convert it from inches to mm if necessary
-float GCodeBuffer::GetDistance()
+float GCodeBuffer::GetDistance() THROWS(GCodeException)
 {
 	return ConvertDistance(GetFValue());
 }
 
 // Get an integer after a key letter
-int32_t GCodeBuffer::GetIValue()
+int32_t GCodeBuffer::GetIValue() THROWS(GCodeException)
 {
 	return PARSER_OPERATION(GetIValue());
 }
@@ -340,72 +381,76 @@ int32_t GCodeBuffer::GetLimitedIValue(char c, int32_t minValue, int32_t maxValue
 }
 
 // Get an unsigned integer value
-uint32_t GCodeBuffer::GetUIValue()
+uint32_t GCodeBuffer::GetUIValue() THROWS(GCodeException)
 {
 	return PARSER_OPERATION(GetUIValue());
 }
 
 // Get an unsigned integer value, throw if >= limit
-uint32_t GCodeBuffer::GetLimitedUIValue(char c, uint32_t maxValuePlusOne) THROWS(GCodeException)
+uint32_t GCodeBuffer::GetLimitedUIValue(char c, uint32_t maxValuePlusOne, uint32_t minValue) THROWS(GCodeException)
 {
 	MustSee(c);
 	const uint32_t ret = GetUIValue();
-	if (ret < maxValuePlusOne)
+	if (ret < minValue)
 	{
-		return ret;
+		throw GCodeException(machineState->lineNumber, -1, "parameter '%c' too low", (uint32_t)c);
 	}
-	throw GCodeException(machineState->lineNumber, -1, "parameter '%c' too high", (uint32_t)c);
+	if (ret >= maxValuePlusOne)
+	{
+		throw GCodeException(machineState->lineNumber, -1, "parameter '%c' too high", (uint32_t)c);
+	}
+	return ret;
 }
 
 // Get an IP address quad after a key letter
-void GCodeBuffer::GetIPAddress(IPAddress& returnedIp)
+void GCodeBuffer::GetIPAddress(IPAddress& returnedIp) THROWS(GCodeException)
 {
 	PARSER_OPERATION(GetIPAddress(returnedIp));
 }
 
 // Get a MAC address sextet after a key letter
-void GCodeBuffer::GetMacAddress(MacAddress& mac)
+void GCodeBuffer::GetMacAddress(MacAddress& mac) THROWS(GCodeException)
 {
 	PARSER_OPERATION(GetMacAddress(mac));
 }
 
 // Get a string with no preceding key letter
-void GCodeBuffer::GetUnprecedentedString(const StringRef& str, bool allowEmpty)
+void GCodeBuffer::GetUnprecedentedString(const StringRef& str, bool allowEmpty) THROWS(GCodeException)
 {
 	PARSER_OPERATION(GetUnprecedentedString(str, allowEmpty));
 }
 
 // Get and copy a quoted string
-void GCodeBuffer::GetQuotedString(const StringRef& str)
+void GCodeBuffer::GetQuotedString(const StringRef& str) THROWS(GCodeException)
 {
 	PARSER_OPERATION(GetQuotedString(str));
 }
 
 // Get and copy a string which may or may not be quoted
-void GCodeBuffer::GetPossiblyQuotedString(const StringRef& str)
+void GCodeBuffer::GetPossiblyQuotedString(const StringRef& str) THROWS(GCodeException)
 {
 	PARSER_OPERATION(GetPossiblyQuotedString(str));
 }
 
-void GCodeBuffer::GetReducedString(const StringRef& str)
+void GCodeBuffer::GetReducedString(const StringRef& str) THROWS(GCodeException)
 {
 	PARSER_OPERATION(GetReducedString(str));
 }
 
 // Get a colon-separated list of floats after a key letter
-void GCodeBuffer::GetFloatArray(float arr[], size_t& length, bool doPad)
+void GCodeBuffer::GetFloatArray(float arr[], size_t& length, bool doPad) THROWS(GCodeException)
 {
 	PARSER_OPERATION(GetFloatArray(arr, length, doPad));
 }
 
 // Get a :-separated list of ints after a key letter
-void GCodeBuffer::GetIntArray(int32_t arr[], size_t& length, bool doPad)
+void GCodeBuffer::GetIntArray(int32_t arr[], size_t& length, bool doPad) THROWS(GCodeException)
 {
 	PARSER_OPERATION(GetIntArray(arr, length, doPad));
 }
 
 // Get a :-separated list of unsigned ints after a key letter
-void GCodeBuffer::GetUnsignedArray(uint32_t arr[], size_t& length, bool doPad)
+void GCodeBuffer::GetUnsignedArray(uint32_t arr[], size_t& length, bool doPad) THROWS(GCodeException)
 {
 	PARSER_OPERATION(GetUnsignedArray(arr, length, doPad));
 }
@@ -417,7 +462,7 @@ void GCodeBuffer::GetDriverIdArray(DriverId arr[], size_t& length)
 }
 
 // If the specified parameter character is found, fetch 'value' and set 'seen'. Otherwise leave val and seen alone.
-bool GCodeBuffer::TryGetFValue(char c, float& val, bool& seen)
+bool GCodeBuffer::TryGetFValue(char c, float& val, bool& seen) THROWS(GCodeException)
 {
 	const bool ret = Seen(c);
 	if (ret)
@@ -429,7 +474,7 @@ bool GCodeBuffer::TryGetFValue(char c, float& val, bool& seen)
 }
 
 // If the specified parameter character is found, fetch 'value' and set 'seen'. Otherwise leave val and seen alone.
-bool GCodeBuffer::TryGetIValue(char c, int32_t& val, bool& seen)
+bool GCodeBuffer::TryGetIValue(char c, int32_t& val, bool& seen) THROWS(GCodeException)
 {
 	const bool ret = Seen(c);
 	if (ret)
@@ -459,7 +504,7 @@ bool GCodeBuffer::TryGetLimitedIValue(char c, int32_t& val, bool& seen, int32_t 
 }
 
 // If the specified parameter character is found, fetch 'value' and set 'seen'. Otherwise leave val and seen alone.
-bool GCodeBuffer::TryGetUIValue(char c, uint32_t& val, bool& seen)
+bool GCodeBuffer::TryGetUIValue(char c, uint32_t& val, bool& seen) THROWS(GCodeException)
 {
 	const bool ret = Seen(c);
 	if (ret)
@@ -482,7 +527,7 @@ bool GCodeBuffer::TryGetLimitedUIValue(char c, uint32_t& val, bool& seen, uint32
 }
 
 // If the specified parameter character is found, fetch 'value' as a Boolean and set 'seen'. Otherwise leave val and seen alone.
-bool GCodeBuffer::TryGetBValue(char c, bool& val, bool& seen)
+bool GCodeBuffer::TryGetBValue(char c, bool& val, bool& seen) THROWS(GCodeException)
 {
 	const bool ret = Seen(c);
 	if (ret)
@@ -496,7 +541,7 @@ bool GCodeBuffer::TryGetBValue(char c, bool& val, bool& seen)
 // Try to get an int array exactly 'numVals' long after parameter letter 'c'.
 // If the wrong number of values is provided, generate an error message and return true.
 // Else set 'seen' if we saw the letter and value, and return false.
-bool GCodeBuffer::TryGetUIArray(char c, size_t numVals, uint32_t vals[], const StringRef& reply, bool& seen, bool doPad)
+bool GCodeBuffer::TryGetUIArray(char c, size_t numVals, uint32_t vals[], const StringRef& reply, bool& seen, bool doPad) THROWS(GCodeException)
 {
 	if (Seen(c))
 	{
@@ -518,7 +563,7 @@ bool GCodeBuffer::TryGetUIArray(char c, size_t numVals, uint32_t vals[], const S
 // Try to get a float array exactly 'numVals' long after parameter letter 'c'.
 // If the wrong number of values is provided, generate an error message and return true.
 // Else set 'seen' if we saw the letter and value, and return false.
-bool GCodeBuffer::TryGetFloatArray(char c, size_t numVals, float vals[], const StringRef& reply, bool& seen, bool doPad)
+bool GCodeBuffer::TryGetFloatArray(char c, size_t numVals, float vals[], const StringRef& reply, bool& seen, bool doPad) THROWS(GCodeException)
 {
 	if (Seen(c))
 	{
@@ -539,7 +584,7 @@ bool GCodeBuffer::TryGetFloatArray(char c, size_t numVals, float vals[], const S
 
 // Try to get a quoted string after parameter letter.
 // If we found it then set 'seen' true and return true, else leave 'seen' alone and return false
-bool GCodeBuffer::TryGetQuotedString(char c, const StringRef& str, bool& seen)
+bool GCodeBuffer::TryGetQuotedString(char c, const StringRef& str, bool& seen) THROWS(GCodeException)
 {
 	if (Seen(c))
 	{
@@ -552,7 +597,7 @@ bool GCodeBuffer::TryGetQuotedString(char c, const StringRef& str, bool& seen)
 
 // Try to get a string, which may be quoted, after parameter letter.
 // If we found it then set 'seen' true and return true, else leave 'seen' alone and return false
-bool GCodeBuffer::TryGetPossiblyQuotedString(char c, const StringRef& str, bool& seen)
+bool GCodeBuffer::TryGetPossiblyQuotedString(char c, const StringRef& str, bool& seen) THROWS(GCodeException)
 {
 	if (Seen(c))
 	{
@@ -564,13 +609,13 @@ bool GCodeBuffer::TryGetPossiblyQuotedString(char c, const StringRef& str, bool&
 }
 
 // Get a PWM frequency
-PwmFrequency GCodeBuffer::GetPwmFrequency()
+PwmFrequency GCodeBuffer::GetPwmFrequency() THROWS(GCodeException)
 {
 	return (PwmFrequency)constrain<uint32_t>(GetUIValue(), 1, 65535);
 }
 
 // Get a PWM value. If may be in the old style 0..255 in which case convert it to be in the range 0.0..1.0
-float GCodeBuffer::GetPwmValue()
+float GCodeBuffer::GetPwmValue() THROWS(GCodeException)
 {
 	float v = GetFValue();
 	if (v > 1.0)
@@ -581,7 +626,7 @@ float GCodeBuffer::GetPwmValue()
 }
 
 // Get a driver ID
-DriverId GCodeBuffer::GetDriverId()
+DriverId GCodeBuffer::GetDriverId() THROWS(GCodeException)
 {
 	return PARSER_OPERATION(GetDriverId());
 }
@@ -594,16 +639,6 @@ bool GCodeBuffer::IsIdle() const noexcept
 bool GCodeBuffer::IsCompletelyIdle() const noexcept
 {
 	return GetState() == GCodeState::normal && IsIdle();
-}
-
-bool GCodeBuffer::IsReady() const noexcept
-{
-	return bufferState == GCodeBufferState::ready;
-}
-
-bool GCodeBuffer::IsExecuting() const noexcept
-{
-	return bufferState == GCodeBufferState::executing;
 }
 
 void GCodeBuffer::SetFinished(bool f) noexcept
@@ -694,7 +729,6 @@ bool GCodeBuffer::PopState(bool withinSameFile) noexcept
 	return true;
 }
 
-
 // Abort execution of any files or macros being executed
 // We now avoid popping the state if we were not executing from a file, so that if DWC or PanelDue is used to jog the axes before they are homed, we don't report stack underflow.
 void GCodeBuffer::AbortFile(bool abortAll, bool requestAbort) noexcept
@@ -730,47 +764,107 @@ void GCodeBuffer::AbortFile(bool abortAll, bool requestAbort) noexcept
 
 #if HAS_LINUX_INTERFACE
 
-bool GCodeBuffer::IsFileFinished() const noexcept
+void GCodeBuffer::SetFileFinished() noexcept
 {
-	return machineState->isFileFinished;
+	FileId macroFileId = NoFileId, printFileId = OriginalMachineState().fileId;
+	for (GCodeMachineState *ms = machineState; ms != nullptr; ms = ms->GetPrevious())
+	{
+		if (macroFileId == NoFileId && ms->fileId != NoFileId && ms->fileId != printFileId && !ms->fileFinished)
+		{
+			// Get the next macro file being executed
+			macroFileId = ms->fileId;
+		}
+
+		if (macroFileId != NoFileId)
+		{
+			if (ms->fileId == macroFileId)
+			{
+				// Flag it (and following machine states) as finished
+				ms->fileFinished = true;
+			}
+			else
+			{
+				break;
+			}
+		}
+	}
+
+	if (macroFileId == NoFileId)
+	{
+		reprap.GetPlatform().Message(WarningMessage, "Cannot set macro file finished because there is no file ID\n");
+	}
 }
 
 void GCodeBuffer::SetPrintFinished() noexcept
 {
-	const uint32_t fileId = OriginalMachineState().fileId;
-	for (GCodeMachineState *ms = machineState; ms != nullptr; ms = ms->GetPrevious())
+	FileId printFileId = OriginalMachineState().fileId;
+	if (printFileId != NoFileId)
 	{
-		if (ms->fileId == fileId)
+		for (GCodeMachineState *ms = machineState; ms != nullptr; ms = ms->GetPrevious())
 		{
-			ms->SetFileFinished(false);
+			if (ms->fileId == printFileId)
+			{
+				// Mark machine states executing the print file as finished
+				ms->fileFinished = true;
+			}
 		}
 	}
+	else
+	{
+		reprap.GetPlatform().Message(WarningMessage, "Cannot set print file finished because there is no file ID\n");
+	}
 }
 
-// This is only called when using the Linux interface. 'filename' is sometimes null.
-void GCodeBuffer::RequestMacroFile(const char *filename, bool reportMissing, bool fromCode) noexcept
+// This is only called when using the Linux interface and returns if the macro file could be opened
+bool GCodeBuffer::RequestMacroFile(const char *filename, bool fromCode) noexcept
 {
-	machineState->SetFileExecuting();
-	if (!fromCode)
+	if (!reprap.GetLinuxInterface().IsConnected())
 	{
-		// This suppresses unwanted replies in the USB console
-		isBinaryBuffer = true;
-		memset(buffer, 0, sizeof(CodeHeader));
+		// Don't wait for a macro file if no SBC is connected
+		return false;
 	}
 
+	// Request the macro file from the SBC
+	macroJustStarted = macroFileError = macroFileEmpty = false;
+	machineState->macroStartedByCode = fromCode;
 	requestedMacroFile.copy(filename);
-	reportMissingMacro = reportMissing;
-	isMacroFromCode = fromCode;
-	macroRequested = true;
 
-	abortFile = abortAllFiles = false;
+	// There is no need to block the main task if daemon.g is requested.
+	// If it doesn't exist, DSF will simply close the virtual file again
+	if (GetChannel() != GCodeChannel::Daemon || machineState->doingFileMacro)
+	{
+		// Wait for a response (but not forever)
+		isWaitingForMacro = true;
+		if (!macroSemaphore.Take(SpiConnectionTimeout))
+		{
+			isWaitingForMacro = false;
+			reprap.GetPlatform().MessageF(ErrorMessage, "Failed to get macro response within %" PRIu32 "ms from SBC (channel %s)\n", SpiConnectionTimeout, GetChannel().ToString());
+			return false;
+		}
+	}
+
+	// When we get here we expect the Linux interface to have set the variables above for us
+	if (!macroFileError)
+	{
+		macroJustStarted = true;
+		return true;
+	}
+	return false;
 }
 
-const char *GCodeBuffer::GetRequestedMacroFile(bool& reportMissing, bool& fromCode) const noexcept
+void GCodeBuffer::ResolveMacroRequest(bool hadError, bool isEmpty) noexcept
 {
-	reportMissing = reportMissingMacro;
-	fromCode = isMacroFromCode;
-	return requestedMacroFile.c_str();
+	macroFileError = hadError;
+	macroFileEmpty = !hadError && isEmpty;
+	isWaitingForMacro = false;
+	macroSemaphore.Give();
+}
+
+void GCodeBuffer::MacroFileClosed() noexcept
+{
+	machineState->CloseFile();
+	macroJustStarted = false;
+	macroFileClosed = true;
 }
 
 #endif
@@ -786,6 +880,9 @@ void GCodeBuffer::MessageAcknowledged(bool cancelled) noexcept
 			ms->waitingForAcknowledgement = false;
 			ms->messageAcknowledged = true;
 			ms->messageCancelled = cancelled;
+#if HAS_LINUX_INTERFACE
+			messageAcknowledged = !cancelled;
+#endif
 		}
 	}
 }
@@ -793,7 +890,7 @@ void GCodeBuffer::MessageAcknowledged(bool cancelled) noexcept
 MessageType GCodeBuffer::GetResponseMessageType() const noexcept
 {
 #if HAS_LINUX_INTERFACE
-	if (isBinaryBuffer)
+	if (machineState->lastCodeFromSbc)
 	{
 		return (MessageType)((1u << codeChannel.ToBaseType()) | BinaryCodeReplyFlag);
 	}
@@ -804,6 +901,17 @@ MessageType GCodeBuffer::GetResponseMessageType() const noexcept
 FilePosition GCodeBuffer::GetFilePosition() const noexcept
 {
 	return PARSER_OPERATION(GetFilePosition());
+}
+
+void GCodeBuffer::WaitForAcknowledgement() noexcept
+{
+	machineState->WaitForAcknowledgement();
+#if HAS_LINUX_INTERFACE
+	if (reprap.UsingLinuxInterface())
+	{
+		messagePromptPending = true;
+	}
+#endif
 }
 
 #if HAS_MASS_STORAGE
@@ -828,9 +936,9 @@ bool GCodeBuffer::IsWritingBinary() const noexcept
 	return NOT_BINARY_AND(stringParser.IsWritingBinary());
 }
 
-void GCodeBuffer::WriteBinaryToFile(char b) noexcept
+bool GCodeBuffer::WriteBinaryToFile(char b) noexcept
 {
-	IF_NOT_BINARY(stringParser.WriteBinaryToFile(b));
+	return BINARY_OR(stringParser.WriteBinaryToFile(b));
 }
 
 void GCodeBuffer::FinishWritingBinary() noexcept
@@ -867,23 +975,6 @@ void GCodeBuffer::PrintCommand(const StringRef& s) const noexcept
 void GCodeBuffer::AppendFullCommand(const StringRef &s) const noexcept
 {
 	PARSER_OPERATION(AppendFullCommand(s));
-}
-
-bool GCodeBuffer::IsPausing() const
-{
-	const GCodeState topState = OriginalMachineState().GetState();
-	return (   topState == GCodeState::pausing1 || topState == GCodeState::pausing2
-			|| topState == GCodeState::filamentChangePause1 || topState == GCodeState::filamentChangePause2
-#if HAS_VOLTAGE_MONITOR
-			|| topState == GCodeState::powerFailPausing1
-#endif
-	   	   );
-}
-
-bool GCodeBuffer::IsResuming() const
-{
-	const GCodeState topState = OriginalMachineState().GetState();
-	return topState == GCodeState::resuming1 || topState == GCodeState::resuming2 || topState == GCodeState::resuming3;
 }
 
 // End

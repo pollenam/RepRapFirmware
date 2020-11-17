@@ -39,21 +39,59 @@ const char *SafeStrptime(const char *buf, const char *format, struct tm *timeptr
 #ifdef array
 # undef array			// needed because some files include <functional>
 #endif
-
-#include "Core.h"
-
-#ifndef SAMC21
-# define SAMC21	(defined(__SAMC21G18A__) && __SAMC21G18A__)
+#ifdef assert
+# undef assert
+#endif
+#ifdef result
+# undef result
 #endif
 
-#ifndef SAME51
-# define SAME51	(defined(__SAME51N19A__) && __SAME51N19A__)
+#include <Core.h>
+
+#ifndef SAMC21
+# error SAMC21 should be defined as 0 or 1
+#endif
+
+#ifndef SAME5x
+# error SAME5X should be defined as 0 or 1
 #endif
 
 #if SAME70
 # define __nocache		__attribute__((section(".ram_nocache")))
 #else
 # define __nocache		// nothing
+#endif
+
+#if SAME5x
+
+# include <CoreIO.h>
+# include <Devices.h>
+
+#else
+
+// Functions needed for builds that use CoreNG. Not needed when using CoreN2G.
+void delay(uint32_t ms) noexcept;
+static inline void WatchdogReset() noexcept { return watchdogReset(); }
+
+// Optimised version of memcpy for use when the source and destination are known to be 32-bit aligned and a whole number of 32-bit words is to be copied
+void memcpyu32(uint32_t *dst, const uint32_t *src, size_t numWords) noexcept;
+
+// memcpy for int32_t arrays
+inline void memcpyi32(int32_t *dst, const int32_t *src, size_t numWords) noexcept
+{
+	static_assert(sizeof(int32_t) == sizeof(uint32_t));
+	static_assert(alignof(int32_t) == alignof(uint32_t));
+	memcpyu32(reinterpret_cast<uint32_t*>(dst), reinterpret_cast<const uint32_t*>(src), numWords);
+}
+
+// memcpy for float arrays
+inline void memcpyf(float *dst, const float *src, size_t numFloats) noexcept
+{
+	static_assert(sizeof(float) == sizeof(uint32_t));
+	static_assert(alignof(float) == alignof(uint32_t));
+	memcpyu32(reinterpret_cast<uint32_t*>(dst), reinterpret_cast<const uint32_t*>(src), numFloats);
+}
+
 #endif
 
 // API level definition.
@@ -65,8 +103,6 @@ constexpr unsigned int ApiLevel = 1;
 typedef uint8_t LogicalPin;				// type used to represent logical pin numbers
 constexpr LogicalPin NoLogicalPin = 0xFF;
 constexpr const char *NoPinName = "nil";
-
-typedef uint16_t PwmFrequency;				// type used to represent a PWM frequency. 0 sometimes means "default".
 
 // Enumeration to describe what we want to do with a pin
 enum class PinAccess : int
@@ -97,9 +133,10 @@ enum class PinUsedBy : uint8_t
 	sensor
 };
 
-#include "Configuration.h"
 #include "Pins.h"
+#include "Configuration.h"
 
+static_assert(MinVisibleAxes <= MinAxes);
 static_assert(NumNamedPins <= 255 || sizeof(LogicalPin) > 1, "Need 16-bit logical pin numbers");
 
 #if SUPPORT_CAN_EXPANSION
@@ -176,14 +213,27 @@ struct DriverId
 
 #else
 
-	void SetFromBinary(uint32_t val) noexcept
+	// Set the driver ID from the binary value, returning true if there was a nonzero board number so that the caller knows the address is not valid
+	bool SetFromBinary(uint32_t val) noexcept
 	{
-		localDriver = (uint8_t)val;
+		localDriver = val & 0x000000FF;
+		const uint32_t brdNum = val >> 16;
+		return (brdNum != 0);
 	}
 
 	void SetLocal(unsigned int driver) noexcept
 	{
 		localDriver = (uint8_t)driver;
+	}
+
+	bool operator==(const DriverId other) const noexcept
+	{
+		return localDriver == other.localDriver;
+	}
+
+	bool operator!=(const DriverId other) const noexcept
+	{
+		return localDriver != other.localDriver;
 	}
 
 	void Clear() noexcept { localDriver = 0; }
@@ -228,7 +278,8 @@ enum Module : uint8_t
 	moduleWiFi = 14,
 	moduleDisplay = 15,
 	moduleLinuxInterface = 16,
-	numModules = 17,				// make this one greater than the last real module number
+	moduleCan = 17,
+	numModules = 18,				// make this one greater than the last real module number
 	noModule = numModules
 };
 
@@ -282,7 +333,11 @@ typedef double floatc_t;						// type of matrix element used for calibration
 typedef float floatc_t;							// type of matrix element used for calibration
 #endif
 
-typedef Bitmap<uint16_t> AxesBitmap;			// Type of a bitmap representing a set of axes
+#ifdef DUET3
+typedef Bitmap<uint32_t> AxesBitmap;			// Type of a bitmap representing a set of axes, and sometimes extruders too
+#else
+typedef Bitmap<uint16_t> AxesBitmap;			// Type of a bitmap representing a set of axes, and sometimes extruders too
+#endif
 typedef Bitmap<uint32_t> ExtrudersBitmap;		// Type of a bitmap representing a set of extruder drive numbers
 typedef Bitmap<uint32_t> DriversBitmap;			// Type of a bitmap representing a set of local driver numbers
 typedef Bitmap<uint32_t> FansBitmap;			// Type of a bitmap representing a set of fan numbers
@@ -291,15 +346,13 @@ typedef Bitmap<uint16_t> DriverChannelsBitmap;	// Type of a bitmap representing 
 typedef Bitmap<uint16_t> InputPortsBitmap;		// Type of a bitmap representing a set of input ports
 typedef Bitmap<uint32_t> TriggerNumbersBitmap;	// Type of a bitmap representing a set of trigger numbers
 
-typedef uint16_t Pwm_t;							// Type of a PWM value when we don't want to use floats
-
-#if SUPPORT_CAN_EXPANSION
+#if defined(DUET3) || defined(DUET3MINI)
 typedef Bitmap<uint64_t> SensorsBitmap;
 #else
 typedef Bitmap<uint32_t> SensorsBitmap;
 #endif
 
-static_assert(MaxAxes <= AxesBitmap::MaxBits());
+static_assert(MaxAxesPlusExtruders <= AxesBitmap::MaxBits());
 static_assert(MaxExtruders <= ExtrudersBitmap::MaxBits());
 static_assert(MaxFans <= FansBitmap::MaxBits());
 static_assert(MaxHeaters <= HeatersBitmap::MaxBits());
@@ -308,8 +361,10 @@ static_assert(MaxSensors <= SensorsBitmap::MaxBits());
 static_assert(MaxGpInPorts <= InputPortsBitmap::MaxBits());
 static_assert(MaxTriggers <= TriggerNumbersBitmap::MaxBits());
 
+typedef uint16_t Pwm_t;							// Type of a PWM value when we don't want to use floats
+
 #if SUPPORT_IOBITS
-typedef uint16_t IoBits_t;					// Type of the port control bitmap (G1 P parameter)
+typedef uint16_t IoBits_t;						// Type of the port control bitmap (G1 P parameter)
 #endif
 
 #if SUPPORT_LASER || SUPPORT_IOBITS
@@ -338,7 +393,6 @@ extern "C" void debugPrintf(const char* fmt, ...) noexcept __attribute__ ((forma
 #define DEBUG_HERE do { debugPrintf("At " __FILE__ " line %d\n", __LINE__); delay(50); } while (false)
 
 // Functions and globals not part of any class
-void delay(uint32_t ms) noexcept;
 
 double HideNan(float val) noexcept;
 
@@ -349,28 +403,6 @@ void ListDrivers(const StringRef& str, DriversBitmap drivers) noexcept;
 
 // UTF8 code for the degree-symbol
 #define DEGREE_SYMBOL	"\xC2\xB0"	// Unicode degree-symbol as UTF8
-
-// Functions to change the base priority, to shut out interrupts up to a priority level
-
-// Get the base priority and shut out interrupts lower than or equal to a specified priority
-inline uint32_t ChangeBasePriority(uint32_t prio) noexcept
-{
-	const uint32_t oldPrio = __get_BASEPRI();
-	__set_BASEPRI_MAX(prio << (8 - __NVIC_PRIO_BITS));
-	return oldPrio;
-}
-
-// Restore the base priority following a call to ChangeBasePriority
-inline void RestoreBasePriority(uint32_t prio) noexcept
-{
-	__set_BASEPRI(prio);
-}
-
-// Set the base priority when we are not interested in the existing value i.e. definitely in non-interrupt code
-inline void SetBasePriority(uint32_t prio) noexcept
-{
-	__set_BASEPRI(prio << (8 - __NVIC_PRIO_BITS));
-}
 
 // Classes to facilitate range-based for loops that iterate from 0 up to just below a limit
 template<class T> class SimpleRangeIterator
@@ -470,7 +502,7 @@ typedef uint32_t FilePosition;
 const FilePosition noFilePosition = 0xFFFFFFFF;
 
 //-------------------------------------------------------------------------------------------------
-// Interrupt priorities - must be chosen with care! 0 is the highest priority, 15 is the lowest.
+// Interrupt priorities - must be chosen with care! 0 is the highest priority, 7 or 15 is the lowest.
 // This interacts with FreeRTOS config constant configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY which is currently defined as 3 for the SAME70 and 5 for the SAM4x.
 // ISRs with better (numerically lower) priorities than this value cannot make FreeRTOS calls, but those interrupts wont be disabled even in FreeRTOS critical sections.
 
@@ -479,52 +511,62 @@ const FilePosition noFilePosition = 0xFFFFFFFF;
 // Use priority 2 or lower for interrupts where low latency is critical and FreeRTOS calls are not needed.
 
 const uint32_t NvicPriorityWatchdog = 0;		// the secondary watchdog has the highest priority
-const uint32_t NvicPriorityPanelDueUart = 1;	// UART is highest to avoid character loss (it has only a 1-character receive buffer)
-const uint32_t NvicPriorityWiFiUart = 2;		// UART used to receive debug data from the WiFi module
 
-const uint32_t NvicPriorityMCan = 3;			// CAN interface
-const uint32_t NvicPriorityPins = 3;			// priority for GPIO pin interrupts - filament sensors must be higher than step
-const uint32_t NvicPriorityStep = 4;			// step interrupt is next highest, it can preempt most other interrupts
-const uint32_t NvicPriorityUSB = 5;				// USB interrupt
-const uint32_t NvicPriorityHSMCI = 5;			// HSMCI command complete interrupt
+#if SAME5x
+const NvicPriority NvicPriorityPanelDueUartRx = 1;	// UART used to receive data from PanelDue or other serial input
+const NvicPriority NvicPriorityPanelDueUartTx = 3;	// the SAME5x driver makes FreeRTOS calls during transmission, so use a lower priority
+const NvicPriority NvicPriorityWiFiUartRx = 2;		// UART used to receive debug data from the WiFi module
+const NvicPriority NvicPriorityWiFiUartTx = 3;		// the SAME5x driver makes FreeRTOS calls during transmission, so use a lower priority
+const NvicPriority NvicPriorityDriverDiag = 4;
+#else
+const NvicPriority NvicPriorityPanelDueUart = 1;	// UART is highest to avoid character loss (it has only a 1-character receive buffer)
+const NvicPriority NvicPriorityWiFiUart = 2;		// UART used to receive debug data from the WiFi module
+#endif
+
+const NvicPriority NvicPriorityCan = 3;				// CAN interface
+const NvicPriority NvicPriorityPins = 3;			// priority for GPIO pin interrupts - filament sensors must be higher than step
+const NvicPriority NvicPriorityDriversSerialTMC = 3; // USART or UART used to control and monitor the smart drivers
+const NvicPriority NvicPriorityStep = 4;			// step interrupt is next highest, it can preempt most other interrupts
+const NvicPriority NvicPriorityUSB = 5;				// USB interrupt
+const NvicPriority NvicPriorityHSMCI = 5;			// HSMCI command complete interrupt
 
 # if HAS_LWIP_NETWORKING
-const uint32_t NvicPriorityNetworkTick = 6;		// priority for network tick interrupt (to be replaced by a FreeRTOS task)
-const uint32_t NvicPriorityEthernet = 6;		// priority for Ethernet interface
+const NvicPriority NvicPriorityNetworkTick = 6;		// priority for network tick interrupt (to be replaced by a FreeRTOS task)
+const NvicPriority NvicPriorityEthernet = 6;		// priority for Ethernet interface
 # endif
 
-const uint32_t NvicPriorityDMA = 6;				// end-of-DMA interrupt used by TMC drivers and HSMCI
-const uint32_t NvicPrioritySpi = 6;				// SPI is used for network transfers on Duet WiFi/Duet vEthernet
+const NvicPriority NvicPriorityDMA = 6;				// end-of-DMA interrupt used by TMC drivers and HSMCI
+const NvicPriority NvicPrioritySpi = 6;				// SPI is used for network transfers on Duet WiFi/Duet vEthernet
 
 #elif __NVIC_PRIO_BITS >= 4
 // We have at least 16 priority levels
 // Use priority 4 or lower for interrupts where low latency is critical and FreeRTOS calls are not needed.
 
 # if SAM4E || defined(__LPC17xx__)
-const uint32_t NvicPriorityWatchdog = 0;		// the secondary watchdog has the highest priority
+const NvicPriority NvicPriorityWatchdog = 0;		// the secondary watchdog has the highest priority
 # endif
 
-const uint32_t NvicPriorityPanelDueUart = 1;	// UART is highest to avoid character loss (it has only a 1-character receive buffer)
-const uint32_t NvicPriorityDriversSerialTMC = 2; // USART or UART used to control and monitor the smart drivers
+const NvicPriority NvicPriorityPanelDueUart = 1;	// UART is highest to avoid character loss (it has only a 1-character receive buffer)
 
 # if defined(__LPC17xx__)
-constexpr uint32_t NvicPriorityTimerPWM = 4;
-constexpr uint32_t NvicPriorityTimerServo = 5;
+constexpr NvicPriority NvicPriorityTimerPWM = 4;
+constexpr NvicPriority NvicPriorityTimerServo = 5;
 # endif
 
-const uint32_t NvicPriorityPins = 5;			// priority for GPIO pin interrupts - filament sensors must be higher than step
-const uint32_t NvicPriorityStep = 6;			// step interrupt is next highest, it can preempt most other interrupts
-const uint32_t NvicPriorityWiFiUart = 7;		// UART used to receive debug data from the WiFi module
-const uint32_t NvicPriorityUSB = 7;				// USB interrupt
-const uint32_t NvicPriorityHSMCI = 7;			// HSMCI command complete interrupt
+const NvicPriority NvicPriorityDriversSerialTMC = 5; // USART or UART used to control and monitor the smart drivers
+const NvicPriority NvicPriorityPins = 5;			// priority for GPIO pin interrupts - filament sensors must be higher than step
+const NvicPriority NvicPriorityStep = 6;			// step interrupt is next highest, it can preempt most other interrupts
+const NvicPriority NvicPriorityWiFiUart = 7;		// UART used to receive debug data from the WiFi module
+const NvicPriority NvicPriorityUSB = 7;				// USB interrupt
+const NvicPriority NvicPriorityHSMCI = 7;			// HSMCI command complete interrupt
 
 # if HAS_LWIP_NETWORKING
-const uint32_t NvicPriorityNetworkTick = 8;		// priority for network tick interrupt (to be replaced by a FreeRTOS task)
-const uint32_t NvicPriorityEthernet = 8;		// priority for Ethernet interface
+const NvicPriority NvicPriorityNetworkTick = 8;		// priority for network tick interrupt (to be replaced by a FreeRTOS task)
+const NvicPriority NvicPriorityEthernet = 8;		// priority for Ethernet interface
 # endif
 
-const uint32_t NvicPrioritySpi = 8;				// SPI is used for network transfers on Duet WiFi/Duet vEthernet
-const uint32_t NvicPriorityTwi = 9;				// TWI is used to read endstop and other inputs on the DueXn
+const NvicPriority NvicPrioritySpi = 8;				// SPI is used for network transfers on Duet WiFi/Duet vEthernet
+const NvicPriority NvicPriorityTwi = 9;				// TWI is used to read endstop and other inputs on the DueXn
 
 #endif
 

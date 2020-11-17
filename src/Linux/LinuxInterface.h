@@ -8,16 +8,21 @@
 #ifndef SRC_LINUX_LINUXINTERFACE_H_
 #define SRC_LINUX_LINUXINTERFACE_H_
 
+#include <RepRapFirmware.h>
+
+#if HAS_LINUX_INTERFACE
+
 #include "RTOSIface/RTOSIface.h"
 
+#include "GCodes/GCodes.h"
 #include "GCodes/GCodeChannel.h"
 #include "GCodes/GCodeFileInfo.h"
 #include "LinuxMessageFormats.h"
+#include "DataTransfer.h"
 #include "MessageType.h"
 
 class Platform;
 
-class DataTransfer;
 class GCodeBuffer;
 
 class OutputBuffer;
@@ -29,54 +34,94 @@ constexpr size_t MaxFileChunkSize = 448;	// Maximum size of file chunks for read
 class LinuxInterface
 {
 public:
-	friend class Platform;
+	LinuxInterface() noexcept;
+	~LinuxInterface();
 
-	LinuxInterface();
-	void Init();
-	void Spin();
-	void Diagnostics(MessageType mtype);
-	bool IsConnected() const;
+	// The Init method must be called prior to calling any of the other methods. Use reprap.UsingLinuxInterface() to guard calls to other members.
+	// OTOH, calling Init when we don't have a SBC connected may cause problems due to noise pickup on the SPI CS and clock inputs
+	void Init() noexcept;
+	void TaskLoop() noexcept;
+	void Diagnostics(MessageType mtype) noexcept;
+	bool IsConnected() const noexcept;
 
-	bool FillBuffer(GCodeBuffer &gb);		// Try to fill up the G-code buffer with the next available G-code
+	bool HasPrintStarted();
+	bool HasPrintStopped();
+	StopPrintReason GetPrintStopReason() const { return printStopReason; }
+	bool FillBuffer(GCodeBuffer &gb) noexcept;		// Try to fill up the G-code buffer with the next available G-code
 
-	void SetPauseReason(FilePosition position, PrintPausedReason reason);	// Notify Linux that the print has been paused
-	const char *GetFileChunk(const char *filename, uint32_t offset, uint32_t maxLength, int32_t& bytesRead, uint32_t &fileLength); 	// Request a file chunk and resume the given task when it has been received
+	void SetPauseReason(FilePosition position, PrintPausedReason reason) noexcept;	// Notify Linux that the print has been paused
+
+	void HandleGCodeReply(MessageType type, const char *reply) noexcept;	// accessed by Platform
+	void HandleGCodeReply(MessageType type, OutputBuffer *buffer) noexcept;	// accessed by Platform
+
+#if SUPPORT_CAN_EXPANSION
+	const char *GetFileChunk(const char *filename, uint32_t offset, uint32_t maxLength, int32_t& bytesRead, uint32_t &fileLength) noexcept; 	// Request a file chunk and resume the given task when it has been received
+#endif
 
 private:
-	DataTransfer *transfer;
+	DataTransfer transfer;
 	bool wasConnected;
 	uint32_t numDisconnects;
 
 	GCodeFileInfo fileInfo;
 	FilePosition pauseFilePosition;
 	PrintPausedReason pauseReason;
-	bool reportPause;
+	bool reportPause, reportPauseWritten, printStarted, printStopped;
+	StopPrintReason printStopReason;
 
 	char codeBuffer[SpiCodeBufferSize];
-	uint16_t rxPointer, txPointer, txLength;
+	volatile uint16_t rxPointer, txPointer, txLength;
 	bool sendBufferUpdate;
 
 	uint32_t iapWritePointer;
+	uint32_t iapRamAvailable;											// must be at least 64Kb otherwise the SPI IAP can't work
 
+#if SUPPORT_CAN_EXPANSION
+	// Data needed when a CAN expansion board requests a firmware file chunk
 	String<FILENAME_MAX> requestedFileName;
 	uint32_t requestedFileOffset, requestedFileLength;
 	BinarySemaphore requestedFileSemaphore;
 	char requestedFileChunk[MaxFileChunkSize];
 	int32_t requestedFileDataLength;
+#endif
 
-	Mutex gcodeReplyMutex;
+	static Mutex gcodeReplyMutex;											// static so that the LinuxInterface is safe to delete even is the mutex is linked into the mutex chain or is in use
 	OutputStack *gcodeReply;
-	void HandleGCodeReply(MessageType type, const char *reply);		// accessed by Platform
-	void HandleGCodeReply(MessageType type, OutputBuffer *buffer);	// accessed by Platform
 
-	void InvalidateBufferChannel(GCodeChannel channel);				// Invalidate every buffered G-code of the corresponding channel from the buffer ring
+	void InvalidateBufferChannel(GCodeChannel channel) noexcept;            // Invalidate every buffered G-code of the corresponding channel from the buffer ring
 };
 
-inline void LinuxInterface::SetPauseReason(FilePosition position, PrintPausedReason reason)
+inline void LinuxInterface::SetPauseReason(FilePosition position, PrintPausedReason reason) noexcept
 {
+	TaskCriticalSectionLocker locker;
 	pauseFilePosition = position;
 	pauseReason = reason;
+	reportPauseWritten = false;
 	reportPause = true;
 }
+
+inline bool LinuxInterface::HasPrintStarted()
+{
+	TaskCriticalSectionLocker locker;
+	if (printStarted)
+	{
+		printStarted = false;
+		return true;
+	}
+	return false;
+}
+
+inline bool LinuxInterface::HasPrintStopped()
+{
+	TaskCriticalSectionLocker locker;
+	if (printStopped)
+	{
+		printStopped = false;
+		return true;
+	}
+	return false;
+}
+
+#endif
 
 #endif

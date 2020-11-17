@@ -38,7 +38,7 @@ void StringParser::Init() noexcept
 	gcodeLineEnd = 0;
 	commandLength = 0;
 	readPointer = -1;
-	hadLineNumber = hadChecksum = overflowed = false;
+	hadLineNumber = hadChecksum = overflowed = seenExpression = false;
 	computedChecksum = 0;
 	gb.bufferState = GCodeBufferState::parseNotStarted;
 	commandIndent = 0;
@@ -204,6 +204,7 @@ bool StringParser::Put(char c) noexcept
 
 			case '{':
 				++braceCount;
+				seenExpression = true;
 				StoreAndAddToChecksum(c);
 				break;
 
@@ -704,75 +705,77 @@ void StringParser::DecodeCommand() noexcept
 		commandLetter = cl;
 		hasCommandNumber = false;
 		commandNumber = -1;
-		parameterStart = commandStart + 1;
-		const bool negative = (gb.buffer[parameterStart] == '-');
-		if (negative)
+		if (cl == 'T' && gb.buffer[commandStart + 1] == '{')
 		{
-			++parameterStart;
+			// It's a T command with an expression for the tool number. This will be treated as if it's "T T{...}.
+			commandLetter = cl;
+			hasCommandNumber = false;
+			parameterStart = commandStart; 			// so that 'Seen('T')' will return true
 		}
-		if (isdigit(gb.buffer[parameterStart]))
+		else
 		{
-			hasCommandNumber = true;
-			// Read the number after the command letter
-			commandNumber = 0;
-			do
-			{
-				commandNumber = (10 * commandNumber) + (gb.buffer[parameterStart] - '0');
-				++parameterStart;
-			}
-			while (isdigit(gb.buffer[parameterStart]));
+			parameterStart = commandStart + 1;
+			const bool negative = (gb.buffer[parameterStart] == '-');
 			if (negative)
 			{
-				commandNumber = -commandNumber;
-			}
-
-			// Read the fractional digit, if any
-			if (gb.buffer[parameterStart] == '.')
-			{
 				++parameterStart;
-				if (isdigit(gb.buffer[parameterStart]))
+			}
+			if (isdigit(gb.buffer[parameterStart]))
+			{
+				hasCommandNumber = true;
+				// Read the number after the command letter
+				commandNumber = 0;
+				do
 				{
-					commandFraction = gb.buffer[parameterStart] - '0';
+					commandNumber = (10 * commandNumber) + (gb.buffer[parameterStart] - '0');
 					++parameterStart;
+				}
+				while (isdigit(gb.buffer[parameterStart]));
+				if (negative)
+				{
+					commandNumber = -commandNumber;
+				}
+
+				// Read the fractional digit, if any
+				if (gb.buffer[parameterStart] == '.')
+				{
+					++parameterStart;
+					if (isdigit(gb.buffer[parameterStart]))
+					{
+						commandFraction = gb.buffer[parameterStart] - '0';
+						++parameterStart;
+					}
 				}
 			}
 		}
 
-		// Find where the end of the command is. We assume that a G or M preceded by a space and not inside quotes or { } is the start of a new command.
+		// Find where the end of the command is. We assume that a G or M not inside quotes or { } is the start of a new command.
 		bool inQuotes = false;
-		unsigned int braceCount = 0;
-		bool primed = false;
+		unsigned int localBraceCount = 0;
 		for (commandEnd = parameterStart; commandEnd < gcodeLineEnd; ++commandEnd)
 		{
 			const char c = gb.buffer[commandEnd];
 			if (c == '"')
 			{
 				inQuotes = !inQuotes;
-				primed = false;
 			}
 			else if (!inQuotes)
 			{
 				char c2;
 				if (c == '{')
 				{
-					++braceCount;
-					primed = false;
+					++localBraceCount;
 				}
-				else if (c == '}')
+				else if (localBraceCount != 0)
 				{
-					if (braceCount != 0)
+					if (c == '}')
 					{
-						--braceCount;
+						--localBraceCount;
 					}
-					primed = false;
 				}
-				else if (primed && ((c2 = toupper(c)) == 'G' || c2 == 'M'))
+				else if ((c2 = toupper(c)) == 'G' || c2 == 'M')
 				{
 					break;
-				}
-				else if (braceCount == 0)
-				{
-					primed = (c == ' ' || c == '\t');
 				}
 			}
 		}
@@ -1370,7 +1373,7 @@ void StringParser::GetMacAddress(MacAddress& mac) THROWS(GCodeException)
 	for (;;)
 	{
 		const char *pp;
-		const unsigned long v = SafeStrtoul(p, &pp, 16);
+		const unsigned long v = StrHexToU32(p, &pp);
 		if (pp == p || v > 255)
 		{
 			readPointer = -1;
@@ -1470,14 +1473,15 @@ void StringParser::WriteToFile() noexcept
 	Init();
 }
 
-void StringParser::WriteBinaryToFile(char b) noexcept
+// Write a character to file, returning true if we finished doing the binary upload
+bool StringParser::WriteBinaryToFile(char b) noexcept
 {
 	if (b == eofString[eofStringCounter] && writingFileSize == 0)
 	{
 		eofStringCounter++;
 		if (eofStringCounter < ARRAY_SIZE(eofString) - 1)
 		{
-			return;					// not reached end of input yet
+			return false;					// not reached end of input yet
 		}
 	}
 	else
@@ -1493,11 +1497,12 @@ void StringParser::WriteBinaryToFile(char b) noexcept
 		fileBeingWritten->Write(b);		// writing one character at a time isn't very efficient, but uploading HTML files via USB is rarely done these days
 		if (writingFileSize == 0 || fileBeingWritten->Length() < writingFileSize)
 		{
-			return;					// not reached end of input yet
+			return false;					// not reached end of input yet
 		}
 	}
 
 	FinishWritingBinary();
+	return true;
 }
 
 void StringParser::FinishWritingBinary() noexcept
@@ -1600,38 +1605,10 @@ uint32_t StringParser::ReadUIValue() THROWS(GCodeException)
 		return val;
 	}
 
-	int base = 10;
-	size_t skipTrailingQuote = 0;
-
-	// Allow "0xNNNN" or "xNNNN" where NNNN are hex digits
-	if (gb.buffer[readPointer] == '"')
-	{
-		++readPointer;
-		skipTrailingQuote = 1;
-		switch (gb.buffer[readPointer])
-		{
-		case 'x':
-		case 'X':
-			base = 16;
-			++readPointer;
-			break;
-
-		case '0':
-			if (gb.buffer[readPointer + 1] == 'x' || gb.buffer[readPointer + 1] == 'X')
-			{
-				base = 16;
-				readPointer += 2;
-			}
-			break;
-
-		default:
-			break;
-		}
-	}
-
+	// Allow "0xNNNN" or "xNNNN" where NNNN are hex digits. We could stop supporting this because we already support {0xNNNN}.
 	const char *endptr;
-	const uint32_t rslt = SafeStrtoul(gb.buffer + readPointer, &endptr, base);
-	readPointer = endptr - gb.buffer + skipTrailingQuote;
+	const uint32_t rslt = StrToU32(gb.buffer + readPointer, &endptr);
+	readPointer = endptr - gb.buffer;
 	return rslt;
 }
 
@@ -1669,7 +1646,20 @@ DriverId StringParser::ReadDriverIdValue() THROWS(GCodeException)
 		result.boardAddress = 0;
 	}
 #else
-	result.localDriver = v1;
+	// We now allow driver names of the form "0.x" on boards without CAN expansion
+	if (gb.buffer[readPointer] == '.')
+	{
+		if (v1 != 0)
+		{
+			throw ConstructParseException("Board address of driver must be 0");
+		}
+		++readPointer;
+		result.localDriver = ReadUIValue();
+	}
+	else
+	{
+		result.localDriver = v1;
+	}
 #endif
 	return result;
 }

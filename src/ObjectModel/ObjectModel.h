@@ -107,18 +107,18 @@ struct ExpressionValue
 	explicit constexpr ExpressionValue(float f) noexcept : type((uint32_t)TypeCode::Float), param(MaxFloatDigitsDisplayedAfterPoint), fVal(f) { }
 	constexpr ExpressionValue(float f, uint8_t numDecimalPlaces) noexcept : type((uint32_t)TypeCode::Float), param(numDecimalPlaces), fVal(f) { }
 	explicit constexpr ExpressionValue(int32_t i) noexcept : type((uint32_t)TypeCode::Int32), param(0), iVal(i) { }
-	explicit ExpressionValue(uint64_t u) noexcept : type((uint32_t)TypeCode::Uint64), param(u >> 32), uVal((uint32_t)u) { }
+	explicit ExpressionValue(uint64_t u) noexcept : type((uint32_t)TypeCode::Uint64) { Set56BitValue(u); }
 	explicit constexpr ExpressionValue(const ObjectModel *om) noexcept : type((om == nullptr) ? (uint32_t)TypeCode::None : (uint32_t)TypeCode::ObjectModel), param(0), omVal(om) { }
 	constexpr ExpressionValue(const ObjectModel *om, uint8_t tableNumber) noexcept : type((om == nullptr) ? (uint32_t)TypeCode::None : (uint32_t)TypeCode::ObjectModel), param(tableNumber), omVal(om) { }
 	explicit constexpr ExpressionValue(const char *s) noexcept : type((uint32_t)TypeCode::CString), param(0), sVal(s) { }
 	explicit constexpr ExpressionValue(const ObjectModelArrayDescriptor *omad) noexcept : type((uint32_t)TypeCode::Array), param(0), omadVal(omad) { }
 	explicit constexpr ExpressionValue(IPAddress ip) noexcept : type((uint32_t)TypeCode::IPAddress), param(0), uVal(ip.GetV4LittleEndian()) { }
 	explicit constexpr ExpressionValue(nullptr_t dummy) noexcept : type((uint32_t)TypeCode::None), param(0), uVal(0) { }
-	explicit ExpressionValue(DateTime t) noexcept : type((t.tim == 0) ? (uint32_t)TypeCode::None : (uint32_t)TypeCode::DateTime), param(t.tim >> 32), uVal((uint32_t)t.tim) { }
+	explicit ExpressionValue(DateTime t) noexcept : type((t.tim == 0) ? (uint32_t)TypeCode::None : (uint32_t)TypeCode::DateTime) { Set56BitValue(t.tim); }
 	explicit ExpressionValue(DriverId id) noexcept : type((uint32_t)TypeCode::DriverId), param(0), uVal(id.AsU32()) { }
 	explicit ExpressionValue(Bitmap<uint16_t> bm) noexcept : type((uint32_t)TypeCode::Bitmap16), param(0), uVal(bm.GetRaw()) { }
 	explicit ExpressionValue(Bitmap<uint32_t> bm) noexcept : type((uint32_t)TypeCode::Bitmap32), param(0), uVal(bm.GetRaw()) { }
-	explicit ExpressionValue(Bitmap<uint64_t> bm) noexcept : type((uint32_t)TypeCode::Bitmap64), param(bm.GetRaw() >> 32), uVal((uint32_t)bm.GetRaw()) { }
+	explicit ExpressionValue(Bitmap<uint64_t> bm) noexcept : type((uint32_t)TypeCode::Bitmap64) { Set56BitValue(bm.GetRaw()); }
 	explicit ExpressionValue(const MacAddress& mac) noexcept;
 	explicit ExpressionValue(SpecialType s, uint32_t u) noexcept : type((uint32_t)TypeCode::Special), param((uint32_t)s), uVal(u) { }
 #if SUPPORT_CAN_EXPANSION
@@ -133,6 +133,9 @@ struct ExpressionValue
 	void Set(int32_t i) noexcept { type = (uint32_t)TypeCode::Int32; iVal = i; }
 	void Set(float f) noexcept { type = (uint32_t)TypeCode::Float; fVal = f; param = 1; }
 	void Set(const char *s) noexcept { type = (uint32_t)TypeCode::CString; sVal = s; }
+
+	// Sore a 56-bit value
+	void Set56BitValue(uint64_t v) { param = (uint32_t)(v >> 32) & 0x00FFFFFF; uVal = (uint32_t)v; }
 
 	// Extract a 56-bit value that we have stored. Used to retrieve date/times and large bitmaps.
 	uint64_t Get56BitValue() const noexcept { return ((uint64_t)param << 32) | uVal; }
@@ -165,7 +168,11 @@ enum class ObjectModelEntryFlags : uint8_t
 class ObjectExplorationContext
 {
 public:
-	ObjectExplorationContext(const char *reportFlags, bool wal, unsigned int initialMaxDepth, int p_line = -1, int p_col = -1) noexcept;
+	// Constructor used when reporting the OM as JSON
+	ObjectExplorationContext(bool wal, const char *reportFlags, unsigned int initialMaxDepth) noexcept;
+
+	// Constructor used when evaluating expressions
+	ObjectExplorationContext(bool wal, int p_line, int p_col) noexcept;
 
 	void SetMaxDepth(unsigned int d) noexcept { maxDepth = d; }
 	bool IncreaseDepth() noexcept { if (currentDepth < maxDepth) { ++currentDepth; return true; } return false; }
@@ -181,6 +188,7 @@ public:
 	bool ShouldReport(const ObjectModelEntryFlags f) const noexcept;
 	bool WantArrayLength() const noexcept { return wantArrayLength; }
 	bool ShouldIncludeNulls() const noexcept { return includeNulls; }
+	uint64_t GetStartMillis() const { return startMillis; }
 
 	GCodeException ConstructParseException(const char *msg) const noexcept;
 	GCodeException ConstructParseException(const char *msg, const char *sparam) const noexcept;
@@ -188,6 +196,7 @@ public:
 private:
 	static constexpr size_t MaxIndices = 4;			// max depth of array nesting
 
+	uint64_t startMillis;							// the milliseconds counter when we started exploring the OM. Stored so that upTime and msUpTime are consistent.
 	unsigned int maxDepth;
 	unsigned int currentDepth;
 	size_t numIndicesProvided;						// the number of indices provided, when we are doing a value lookup
@@ -195,11 +204,11 @@ private:
 	int32_t indices[MaxIndices];
 	int line;
 	int column;
-	bool shortForm;
-	bool onlyLive;
-	bool includeVerbose;
-	bool wantArrayLength;
-	bool includeNulls;
+	unsigned int shortForm : 1,
+				onlyLive : 1,
+				includeVerbose : 1,
+				wantArrayLength : 1,
+				includeNulls : 1;
 };
 
 // Entry to describe an array of objects or values. These must be brace-initializable into flash memory.
@@ -227,7 +236,8 @@ public:
 	ExpressionValue GetObjectValue(ObjectExplorationContext& context, const ObjectModelClassDescriptor * null classDescriptor, const char *idString, uint8_t tableNumber = 0) const THROWS(GCodeException);
 
 	// Function to report a value or object as JSON
-	void ReportItemAsJson(OutputBuffer *buf, ObjectExplorationContext& context, const ObjectModelClassDescriptor *classDescriptor, ExpressionValue val, const char *filter) const THROWS(GCodeException);
+	void ReportItemAsJson(OutputBuffer *buf, ObjectExplorationContext& context, const ObjectModelClassDescriptor *classDescriptor,
+							const ExpressionValue& val, const char *filter) const THROWS(GCodeException);
 
 	// Skip the current element in the ID or filter string
 	static const char* GetNextElement(const char *id) noexcept;
@@ -240,7 +250,7 @@ protected:
 	void ReportArrayAsJson(OutputBuffer *buf, ObjectExplorationContext& context, const ObjectModelClassDescriptor *classDescriptor, const ObjectModelArrayDescriptor *omad, const char *filter) const THROWS(GCodeException);
 
 	// Get the value of an object that we hold
-	ExpressionValue GetObjectValue(ObjectExplorationContext& context, const ObjectModelClassDescriptor *classDescriptor, ExpressionValue val, const char *idString) const THROWS(GCodeException);
+	ExpressionValue GetObjectValue(ObjectExplorationContext& context, const ObjectModelClassDescriptor *classDescriptor, const ExpressionValue& val, const char *idString) const THROWS(GCodeException);
 
 	// Get the object model table entry for the current level object in the query
 	const ObjectModelTableEntry *FindObjectModelTableEntry(const ObjectModelClassDescriptor *classDescriptor, uint8_t tableNumber, const char *idString) const noexcept;
@@ -248,11 +258,18 @@ protected:
 	virtual const ObjectModelClassDescriptor *GetObjectModelClassDescriptor() const noexcept = 0;
 
 private:
-	__attribute__ ((noinline)) static void ReportDateTime(OutputBuffer *buf, ExpressionValue val) noexcept;
+	// These functions have been separated from ReportItemAsJson to avoid high stack usage in the recursive functions, therefore they must not be inlined
+	__attribute__ ((noinline)) void ReportArrayLengthAsJson(OutputBuffer *buf, ObjectExplorationContext& context, const ExpressionValue& val) const noexcept;
+	__attribute__ ((noinline)) void ReportItemAsJsonFull(OutputBuffer *buf, ObjectExplorationContext& context, const ObjectModelClassDescriptor *classDescriptor,
+															const ExpressionValue& val, const char *filter) const THROWS(GCodeException);
+	__attribute__ ((noinline)) static void ReportDateTime(OutputBuffer *buf, const ExpressionValue& val) noexcept;
+	__attribute__ ((noinline)) static void ReportFloat(OutputBuffer *buf, const ExpressionValue& val) noexcept;
+	__attribute__ ((noinline)) static void ReportBitmap1632Long(OutputBuffer *buf, const ExpressionValue& val) noexcept;
+	__attribute__ ((noinline)) static void ReportBitmap64Long(OutputBuffer *buf, const ExpressionValue& val) noexcept;
 
-#ifdef DUET3
-	__attribute__ ((noinline)) static void ReportExpansionBoardDetail(OutputBuffer *buf, ExpressionValue val) noexcept;
-	__attribute__ ((noinline)) static ExpressionValue GetExpansionBoardDetailLength(ExpressionValue val) noexcept;
+#if SUPPORT_CAN_EXPANSION
+	__attribute__ ((noinline)) static void ReportExpansionBoardDetail(OutputBuffer *buf, const ExpressionValue& val) noexcept;
+	__attribute__ ((noinline)) static ExpressionValue GetExpansionBoardDetailLength(const ExpressionValue& val) noexcept;
 #endif
 
 };

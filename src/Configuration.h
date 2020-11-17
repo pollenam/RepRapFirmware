@@ -24,6 +24,7 @@ Licence: GPL
 #define CONFIGURATION_H
 
 #include <cstddef>			// for size_t
+#include <cstring>			// for strlen
 
 // Generic constants
 constexpr float ABS_ZERO = -273.15;						// Celsius
@@ -53,6 +54,7 @@ constexpr float DefaultAxisMinimum = 0.0;
 constexpr float DefaultAxisMaximum = 200.0;
 
 constexpr uint32_t MaxTools = 50;						// this limit is to stop the serialised object model getting too large
+constexpr unsigned int MinVisibleAxes = 2;				// the minimum number of axes that we allow to be visible
 
 // Timeouts
 constexpr uint32_t FanCheckInterval = 500;				// Milliseconds
@@ -98,16 +100,18 @@ constexpr uint32_t DefaultHeaterFaultTimeout = 10 * 60 * 1000;	// How long we wa
 
 // Heating model default parameters. For the chamber heater, we use the same values as for the bed heater.
 // These parameters are about right for an E3Dv6 hot end with 30W heater.
-constexpr float DefaultHotEndHeaterGain = 340.0;
-constexpr float DefaultHotEndHeaterTimeConstant = 140.0;
-constexpr float DefaultHotEndHeaterDeadTime = 5.5;
+constexpr float DefaultHotEndHeaterCoolingRate = 1.0/140.0;		// E3D V6 has a cooling time constant of about 140 seconds with the fan off
+constexpr float DefaultHotEndHeaterHeatingRate = 340.0 * DefaultHotEndHeaterCoolingRate;
+constexpr float DefaultHotEndHeaterDeadTime = 5.5;		// E3D v6
 
 constexpr unsigned int FirstExtraHeaterProtection = 100;	// Index of the first extra heater protection item
 
 // Default thermistor parameters
-constexpr float DefaultR25 = 100000.0;
-constexpr float DefaultBeta = 4388.0;
-constexpr float DefaultShc = 0.0;
+#if !defined(DUET3) && !defined(DUET3MINI)				// for Duet 3 these are defined in Duet3Common.h in project CANLib
+constexpr float DefaultThermistorR25 = 100000.0;
+constexpr float DefaultThermistorBeta = 4725.0;
+constexpr float DefaultThermistorC = 7.06e-8;
+#endif
 
 // These parameters are about right for a typical PCB bed heater that maxes out at 110C
 constexpr float DefaultBedHeaterGain = 90.0;
@@ -126,15 +130,17 @@ static_assert(DefaultMaxTempExcursion > TEMPERATURE_CLOSE_ENOUGH, "DefaultMaxTem
 
 // PWM frequencies
 constexpr PwmFrequency SlowHeaterPwmFreq = 10;			// slow PWM frequency for bed and chamber heaters, compatible with DC/AC SSRs
-constexpr PwmFrequency NormalHeaterPwmFreq = 250;		// normal PWM frequency used for hot ends
+constexpr PwmFrequency DefaultHeaterPwmFreq = 250;		// normal PWM frequency used for hot ends
 constexpr PwmFrequency MaxHeaterPwmFrequency = 1000;	// maximum supported heater PWM frequency, to avoid overheating the mosfets
 constexpr PwmFrequency DefaultFanPwmFreq = 250;			// increase to 25kHz using M106 command to meet Intel 4-wire PWM fan specification
 constexpr PwmFrequency DefaultPinWritePwmFreq = 500;	// default PWM frequency for M42 pin writes and extrusion ancillary PWM
 constexpr PwmFrequency ServoRefreshFrequency = 50;
 
 // Fan defaults
+#if !defined(DUET3) && !defined(DUET3MINI)				// for Duet 3 these are defined in Duet3Common.h in project CANLib
 constexpr float DefaultMinFanPwm = 0.1;					// minimum fan PWM
 constexpr uint32_t DefaultFanBlipTime = 100;			// fan blip time in milliseconds
+#endif
 
 // Conditional GCode support
 constexpr unsigned int MaxBlockIndent = 10;				// maximum indentation of GCode. Each level of indentation introduced a new block.
@@ -147,7 +153,7 @@ constexpr unsigned int MaxBlockIndent = 10;				// maximum indentation of GCode. 
 //     Using single-precision maths and up to 9-factor calibration: (9 + 5) * 4 bytes per point
 //     Using double-precision maths and up to 9-factor calibration: (9 + 5) * 8 bytes per point
 //   So 32 points using double precision arithmetic need 3584 bytes of stack space.
-#if SAM4E || SAM4S || SAME70
+#if SAM4E || SAM4S || SAME70 || SAME5x
 constexpr size_t MaxGridProbePoints = 441;				// 441 allows us to probe e.g. 400x400 at 20mm intervals
 constexpr size_t MaxXGridPoints = 41;					// Maximum number of grid points in one X row
 constexpr size_t MaxProbePoints = 32;					// Maximum number of G30 probe points
@@ -190,7 +196,7 @@ constexpr float DefaultProbingSpeed = 2.0;				// Default Z probing speed mm/sec
 constexpr float DefaultZProbeTravelSpeed = 100.0;		// Default speed for travel to probe points
 constexpr float ZProbeMaxAcceleration = 250.0;			// Maximum Z acceleration to use at the start of a probing move
 
-#if !SAME70												// Using SAME70 as a proxy for Duet 3
+#if !defined(DUET3) && !defined(DUET3MINI)				// for Duet 3 these are defined in Duet3Common.h in project CANLib
 constexpr size_t MaxZProbeProgramBytes = 8;				// Maximum number of bytes in a Z probe program
 #endif
 
@@ -206,7 +212,7 @@ constexpr float SILLY_Z_VALUE = -9999.0;				// Millimetres
 constexpr size_t MaxMessageLength = 256;
 constexpr size_t MaxTitleLength = 61;
 
-#if SAM4E || SAM4S || SAME70 || ESP_NETWORKING
+#if SAM4E || SAM4S || SAME70 || SAME5x || defined(ESP_NETWORKING)
 constexpr size_t MaxFilenameLength = 120;				// Maximum length of a filename including the path
 constexpr size_t MaxVariableNameLength = 120;
 #else
@@ -229,21 +235,23 @@ constexpr size_t MachineNameLength = StringLength50;
 constexpr size_t RepRapPasswordLength = StringLength20;
 constexpr size_t MediumStringLength = MaxFilenameLength;
 constexpr size_t StringBufferLength = StringLength256;	// Length of the string buffer used by the expression parser
+constexpr size_t StringLengthLoggedCommand = StringLength100;	// Length of a string buffer for a command to be logged
 
-#if SAM4E || SAM4S || SAME70 || ESP_NETWORKING
-// Increased GCODE_LENGTH on the SAM4 because M587 and M589 commands on the Duet WiFi can get very long
-constexpr size_t GCODE_LENGTH = 161;					// maximum number of non-comment characters in a line of GCode including the null terminator
-constexpr size_t SHORT_GCODE_LENGTH = 61;				// maximum length of a GCode that we can queue to synchronise it to a move
+#if SAM4E || SAM4S || SAME70 || SAME5x || defined(ESP_NETWORKING)
+// Increased GCODE_LENGTH on the SAM4 because M587 and M589 commands on the Duet WiFi can get very long and GCode meta commands can get even longer
+constexpr size_t GCODE_LENGTH = 201;					// maximum number of non-comment characters in a line of GCode including the null terminator
 #else
 constexpr size_t GCODE_LENGTH = 101;					// maximum number of non-comment characters in a line of GCode including the null terminator
-constexpr size_t SHORT_GCODE_LENGTH = 61;				// maximum length of a GCode that we can queue to synchronise it to a move
 #endif
+
+// Define the maximum length of a GCode that we can queue to synchronise it to a move. Long enough for M150 R255 U255 B255 P255 S255 F1 encoded in binary mode (64 bytes).
+constexpr size_t SHORT_GCODE_LENGTH = 64;
 
 // Output buffer length and number of buffers
 // When using RTOS, it is best if it is possible to fit an HTTP response header in a single buffer. Our headers are currently about 230 bytes long.
 // A note on reserved buffers: the worst case is when a GCode with a long response is processed. After string the response, there must be enough buffer space
 // for the HTTP responder to return a status response. Otherwise DWC never gets to know that it needs to make a rr_reply call and the system deadlocks.
-#if SAME70
+#if SAME70 || SAME5x
 constexpr size_t OUTPUT_BUFFER_SIZE = 256;				// How many bytes does each OutputBuffer hold?
 constexpr size_t OUTPUT_BUFFER_COUNT = 40;				// How many OutputBuffer instances do we have?
 constexpr size_t RESERVED_OUTPUT_BUFFERS = 4;			// Number of reserved output buffers after long responses, enough to hold a status response
@@ -266,12 +274,12 @@ constexpr size_t RESERVED_OUTPUT_BUFFERS = 2;           // Number of reserved ou
 constexpr size_t maxQueuedCodes = 16;					// How many codes can be queued?
 
 // These two definitions are only used if TRACK_OBJECT_NAMES is defined, however that definition isn't available in this file
-#if SAME70
-constexpr size_t MaxTrackedObjects = 30;				// How many build plate objects we track. Each one needs 24 bytes of storage, in addition to the string space.
-constexpr size_t ObjectNamesStringSpace = 600;			// How much space we reserve for the names of objects on the build plate
+#if SAME70 || SAME5x
+constexpr size_t MaxTrackedObjects = 32;				// How many build plate objects we track. Each one needs 16 bytes of storage, in addition to the string space.
+constexpr size_t ObjectNamesStringSpace = 1000;			// How much space we reserve for the names of objects on the build plate
 #else
-constexpr size_t MaxTrackedObjects = 10;				// How many build plate objects we track. Each one needs 24 bytes of storage, in addition to the string space.
-constexpr size_t ObjectNamesStringSpace = 200;			// How much space we reserve for the names of objects on the build plate
+constexpr size_t MaxTrackedObjects = 20;				// How many build plate objects we track. Each one needs 16 bytes of storage, in addition to the string space.
+constexpr size_t ObjectNamesStringSpace = 500;			// How much space we reserve for the names of objects on the build plate
 #endif
 
 // Move system
@@ -300,7 +308,8 @@ constexpr float FILAMENT_WIDTH = 1.75;					// Millimetres
 constexpr unsigned int MaxStackDepth = 7;				// Maximum depth of stack (was 5 in 3.01-RC2, increased to 7 for 3.01-RC3)
 
 // CNC and laser support
-constexpr float DefaultMaxSpindleRpm = 10000;			// Default spindle RPM at full PWM
+constexpr int32_t DefaultMinSpindleRpm = 60;			// Default minimum available spindle RPM
+constexpr int32_t DefaultMaxSpindleRpm = 10000;			// Default spindle RPM at full PWM
 constexpr float DefaultMaxLaserPower = 255.0;			// Power setting in M3 command for full power
 constexpr uint32_t LaserPwmIntervalMillis = 5;			// Interval (ms) between adjusting the laser PWM during acceleration or deceleration
 

@@ -15,10 +15,11 @@
 #include "RepRapFirmware.h"
 #include "MessageType.h"
 
-constexpr uint8_t LinuxFormatCode = 0x5F;
+constexpr uint8_t LinuxFormatCode = 0x5F;			// standard format code for RRF SPI protocol
+constexpr uint8_t LiunxFormatCodeStandalone = 0x60;	// used to indicate that RRF is running in stand-alone mode
 constexpr uint8_t InvalidFormatCode = 0xC9;			// must be different from any other format code
 
-constexpr uint16_t LinuxProtocolVersion = 2;
+constexpr uint16_t LinuxProtocolVersion = 3;
 
 constexpr size_t LinuxTransferBufferSize = 8192;	// maximum length of a data transfer. Must be a multiple of 4 and kept in sync with Duet Control Server!
 static_assert(LinuxTransferBufferSize % sizeof(uint32_t) == 0, "LinuxTransferBufferSize must be a whole number of dwords");
@@ -149,7 +150,7 @@ struct EvaluationResultHeader
 struct ExecuteMacroHeader
 {
 	uint8_t channel;
-	bool reportMissing;
+	uint8_t dummy;
 	bool fromCode;
 	uint8_t length;
 };
@@ -169,14 +170,16 @@ enum class FirmwareRequest : uint16_t
 	Message = 3,						// Message from the firmware
 	ExecuteMacro = 4,					// Request execution of a macro file
 	AbortFile = 5,						// Request the current file to be closed
-	StackEvent_Obsolete = 6,			// Stack has been changed
+	StackEvent_Obsolete = 6,			// Stack has been changed (unused)
 	PrintPaused = 7,					// Print has been paused
 	HeightMap = 8,						// Response to a heightmap request
 	Locked = 9,							// Movement has been locked and machine is in standstill
 	FileChunk = 10,						// Request another chunk of a file
 	EvaluationResult = 11,				// Response to an expression evaluation request
 	DoCode = 12,						// Perform a G/M/T-code from a code input
-	WaitForMessageAcknowledgment = 13	// Wait for a message to be acknowledged
+	WaitForMessageAcknowledgment = 13,	// Wait for a message to be acknowledged
+	MacroFileClosed = 14,				// Last macro file has been closed
+	MessageAcknowledged = 15			// Pending message prompt has been acknowledged
 };
 
 enum class PrintPausedReason : uint8_t
@@ -186,7 +189,7 @@ enum class PrintPausedReason : uint8_t
 	filamentChange = 3,
 	trigger = 4,
 	heaterFault = 5,
-	filament = 6,
+	filamentError = 6,
 	stall = 7,
 	lowVoltage = 8
 };
@@ -217,7 +220,7 @@ enum class LinuxRequest : uint16_t
 	WriteIap = 12,								// Write another chunk of the IAP binary
 	StartIap = 13,								// Launch the IAP binary
 	AssignFilament = 14,						// Assign filament to an extruder
-	FileChunk = 15,								// Response to a file chunk request
+	FileChunk = 15,								// Response to a file chunk request from a CAN-connected board
 	EvaluateExpression = 16,					// Evaluate an arbitrary expression
 	Message = 17,								// Send an arbitrary message
 

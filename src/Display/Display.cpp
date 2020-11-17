@@ -9,6 +9,8 @@
 
 #if SUPPORT_12864_LCD
 
+#include "Lcd/ST7920/Lcd7920.h"
+#include "Lcd/ST7567/Lcd7567.h"
 #include "GCodes/GCodes.h"
 #include "GCodes/GCodeBuffer/GCodeBuffer.h"
 #include "Hardware/IoPorts.h"
@@ -26,73 +28,95 @@ constexpr size_t LargeFontNumber = 1;
 constexpr uint32_t NormalRefreshMillis = 250;
 constexpr uint32_t FastRefreshMillis = 50;
 
+#if SUPPORT_OBJECT_MODEL
+
+// Object model table and functions
+// Note: if using GCC version 7.3.1 20180622 and lambda functions are used in this table, you must compile this file with option -std=gnu++17.
+// Otherwise the table will be allocated in RAM instead of flash, which wastes too much RAM.
+
+// Macro to build a standard lambda function that includes the necessary type conversions
+#define OBJECT_MODEL_FUNC(...) OBJECT_MODEL_FUNC_BODY(Display, __VA_ARGS__)
+#define OBJECT_MODEL_FUNC_IF(...) OBJECT_MODEL_FUNC_IF_BODY(Display, __VA_ARGS__)
+
+constexpr ObjectModelTableEntry Display::objectModelTable[] =
+{
+	// Within each group, these entries must be in alphabetical order
+	// 0. Display members
+	{ "pulsesPerClick",			OBJECT_MODEL_FUNC((int32_t)self->encoder->GetPulsesPerClick()), 	ObjectModelEntryFlags::none },
+	{ "spiFreq",				OBJECT_MODEL_FUNC((int32_t)self->lcd->GetSpiFrequency()), 			ObjectModelEntryFlags::none },
+	{ "typeName", 				OBJECT_MODEL_FUNC(self->lcd->GetDisplayTypeName()), 				ObjectModelEntryFlags::none },
+};
+
+constexpr uint8_t Display::objectModelTableDescriptor[] = { 1, 3 };
+
+DEFINE_GET_OBJECT_MODEL_TABLE(Display)
+
+#endif
+
 Display::Display() noexcept
 	: lcd(nullptr), menu(nullptr), encoder(nullptr), lastRefreshMillis(0),
 	  mboxSeq(0), mboxActive(false), beepActive(false), updatingFirmware(false)
 {
 }
 
+// Keep the display and encoder refreshed. Don't touch the display if we are updating the firmware because the associated RAM may be overwritten by the IAP.
 void Display::Spin() noexcept
 {
-	if (lcd != nullptr)
+	if (lcd != nullptr && !updatingFirmware)
 	{
 		encoder->Poll();
-
-		if (!updatingFirmware)
+		// Check encoder and update display
+		const int ch = encoder->GetChange();
+		bool forceRefresh = false;
+		if (ch != 0)
 		{
-			// Check encoder and update display
-			const int ch = encoder->GetChange();
-			bool forceRefresh = false;
-			if (ch != 0)
-			{
-				menu->EncoderAction(ch);
-				forceRefresh = true;
-			}
-			else if (encoder->GetButtonPress())
-			{
-				menu->EncoderAction(0);
-				forceRefresh = true;
-			}
+			menu->EncoderAction(ch);
+			forceRefresh = true;
+		}
+		else if (encoder->GetButtonPress())
+		{
+			menu->EncoderAction(0);
+			forceRefresh = true;
+		}
 
-			const MessageBox& mbox = reprap.GetMessageBox();
-			if (mbox.active)
+		const MessageBox& mbox = reprap.GetMessageBox();
+		if (mbox.active)
+		{
+			if (!mboxActive || mboxSeq != mbox.seq)
 			{
-				if (!mboxActive || mboxSeq != mbox.seq)
+				// New message box to display
+				if (!mboxActive)
 				{
-					// New message box to display
-					if (!mboxActive)
-					{
-						menu->ClearHighlighting();					// cancel highlighting and adjustment
-						menu->Refresh();
-					}
-					mboxActive = true;
-					mboxSeq = mbox.seq;
-					menu->DisplayMessageBox(mbox);
-					forceRefresh = true;
+					menu->ClearHighlighting();					// cancel highlighting and adjustment
+					menu->Refresh();
 				}
-			}
-			else if (mboxActive)
-			{
-				// Message box has been cancelled from this or another input channel
-				menu->ClearMessageBox();
-				mboxActive = false;
+				mboxActive = true;
+				mboxSeq = mbox.seq;
+				menu->DisplayMessageBox(mbox);
 				forceRefresh = true;
 			}
+		}
+		else if (mboxActive)
+		{
+			// Message box has been cancelled from this or another input channel
+			menu->ClearMessageBox();
+			mboxActive = false;
+			forceRefresh = true;
+		}
 
-			const uint32_t now = millis();
-			if (forceRefresh)
-			{
-				menu->Refresh();
-				// To avoid a noticeable delay in updating the coordinates and babystepping offset when live adjusting them and we stop rotating the encoder,
-				// we force another update 50ms after any encoder actions
-				lastRefreshMillis = now - (NormalRefreshMillis - FastRefreshMillis);
-			}
-			else if (now - lastRefreshMillis >= NormalRefreshMillis)
-			{
-				menu->Refresh();
-				// When the encoder is inactive, we update at most 5 times per second, to avoid rapidly-changing values flickering on the display
-				lastRefreshMillis = now;
-			}
+		const uint32_t now = millis();
+		if (forceRefresh)
+		{
+			menu->Refresh();
+			// To avoid a noticeable delay in updating the coordinates and babystepping offset when live adjusting them and we stop rotating the encoder,
+			// we force another update 50ms after any encoder actions
+			lastRefreshMillis = now - (NormalRefreshMillis - FastRefreshMillis);
+		}
+		else if (now - lastRefreshMillis >= NormalRefreshMillis)
+		{
+			menu->Refresh();
+			// When the encoder is inactive, we update at most 5 times per second, to avoid rapidly-changing values flickering on the display
+			lastRefreshMillis = now;
 		}
 		lcd->FlushSome();
 
@@ -144,38 +168,54 @@ void Display::ErrorBeep() noexcept
 	Beep(500, 1000);
 }
 
-GCodeResult Display::Configure(GCodeBuffer& gb, const StringRef& reply) noexcept
+void Display::InitDisplay(GCodeBuffer& gb, Lcd *newLcd, Pin csPin, Pin a0Pin, bool defaultCsPolarity) THROWS(GCodeException)
+{
+	// ST7567-based displays need a resistor ration setting and a contrast setting
+	// For now we always pass these as parameters toLcd::Init(). If we get any more, consider passing the GCodeBuffer and letting the display pick the parameters instead.
+	const uint32_t contrast = (gb.Seen('C')) ? gb.GetUIValue() : DefaultDisplayContrastRatio;
+	const uint32_t resistorRatio = (gb.Seen('R')) ? gb.GetUIValue() : DefaultDisplayResistorRatio;
+	newLcd->Init(csPin, a0Pin, defaultCsPolarity, (gb.Seen('F')) ? gb.GetUIValue() : LcdSpiClockFrequency, contrast, resistorRatio);
+	IoPort::SetPinMode(LcdBeepPin, OUTPUT_PWM_LOW);
+	newLcd->SetFont(SmallFontNumber);
+
+	if (encoder == nullptr)
+	{
+		encoder = new RotaryEncoder(EncoderPinA, EncoderPinB, EncoderPinSw);
+		encoder->Init(DefaultPulsesPerClick);
+	}
+	menu = new Menu(*newLcd);
+	menu->Load("main");
+	lcd = newLcd;
+}
+
+GCodeResult Display::Configure(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException)
 {
 	bool seen = false;
 
 	if (gb.Seen('P'))
 	{
+		Lcd *tempLcd = nullptr;
+		std::swap(lcd, tempLcd);
+		delete tempLcd;
+		delete menu;
+		menu = nullptr;
+
 		seen = true;
 		switch (gb.GetUIValue())
 		{
-		case 1:		// 12864 display
-			if (lcd == nullptr)
-			{
-				lcd = new Lcd7920(LcdCSPin, fonts, ARRAY_SIZE(fonts));
-			}
-			if (gb.Seen('F'))
-			{
-				lcd->SetSpiClockFrequency(gb.GetUIValue());
-			}
-			lcd->Init();
-			IoPort::SetPinMode(LcdBeepPin, OUTPUT_PWM_LOW);
-			lcd->SetFont(SmallFontNumber);
+		case 1:		// 12864 display, ST7920 controller
+			InitDisplay(gb, new Lcd7920(fonts, ARRAY_SIZE(fonts)), LcdCSPin, NoPin, true);
+			break;
 
-			if (encoder == nullptr)
-			{
-				encoder = new RotaryEncoder(EncoderPinA, EncoderPinB, EncoderPinSw);
-				encoder->Init(DefaultPulsesPerClick);
-			}
-			if (menu == nullptr)
-			{
-				menu = new Menu(*lcd);
-			}
-			menu->Load("main");
+		case 2:		// 12864 display, ST7567 controller
+#ifdef DUET_M
+			// On the Duet Maestro only, the CS pin is active high and gates the clock signal.
+			// The ST7567 needs an active low CS signal, so we must use a different CS pin and set the original one high to let the clock through.
+			pinMode(LcdCSPin, OUTPUT_HIGH);
+			InitDisplay(gb, new Lcd7567(fonts, ARRAY_SIZE(fonts)), LcdCSAltPin, LcdA0Pin, false);
+#else
+			InitDisplay(gb, new Lcd7567(fonts, ARRAY_SIZE(fonts)), LcdCSPin, LcdA0Pin, false);
+#endif
 			break;
 
 		default:
@@ -194,11 +234,12 @@ GCodeResult Display::Configure(GCodeBuffer& gb, const StringRef& reply) noexcept
 	{
 		if (lcd != nullptr)
 		{
-			reply.printf("12864 display is configured, pulses-per-click is %d", encoder->GetPulsesPerClick());
+			reply.printf("Direct connect display: %s, %.2fMHz, %d encoder pulses per click",
+							lcd->GetDisplayTypeName(), (double)(lcd->GetSpiFrequency() * 0.000001), encoder->GetPulsesPerClick());
 		}
 		else
 		{
-			reply.copy("12864 display is not present or not configured");
+			reply.copy("Direct-connect display not present or not configured");
 		}
 	}
 	return GCodeResult::ok;

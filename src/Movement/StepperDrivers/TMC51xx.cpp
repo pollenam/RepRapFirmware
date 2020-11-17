@@ -14,11 +14,11 @@
 #include <RTOSIface/RTOSIface.h>
 #include <TaskPriorities.h>
 #include <Movement/Move.h>
-#include <Hardware/DmacManager.h>
+#include <DmacManager.h>
 #include <Endstops/Endstop.h>
 #include <General/Portability.h>
 
-#if SAME51 || SAMC21
+#if SAME5x || SAMC21
 
 # include <Hardware/IoPorts.h>
 # include <Hardware/Peripherals.h>
@@ -28,6 +28,8 @@
 static inline const Move& GetMoveInstance() noexcept { return *moveInstance; }
 
 #elif SAME70
+
+#include <sam/drivers/xdmac/xdmac.h>
 
 # define TMC51xx_USES_SERCOM	0
 static inline const Move& GetMoveInstance() noexcept { return reprap.GetMove(); }
@@ -256,13 +258,14 @@ static constexpr size_t numTmc51xxDrivers = MaxSmartDrivers;
 
 enum class DriversState : uint8_t
 {
-	noPower = 0,			// no VIN power
+	shutDown = 0,
+	noPower,				// no VIN power
 	notInitialised,			// have VIN power but not started initialising drivers
 	initialising,			// in the process of initialising the drivers
 	ready					// drivers are initialised and ready
 };
 
-static DriversState driversState = DriversState::noPower;
+static DriversState driversState = DriversState::shutDown;
 
 //----------------------------------------------------------------------------------------------------------------------------------
 // Private types and methods
@@ -335,7 +338,7 @@ private:
 
 	static const uint8_t WriteRegNumbers[NumWriteRegisters];	// the register numbers that we write to
 
-	static constexpr unsigned int NumReadRegisters = 4;		// the number of registers that we read from
+	static constexpr unsigned int NumReadRegisters = 5;		// the number of registers that we read from
 	static const uint8_t ReadRegNumbers[NumReadRegisters];	// the register numbers that we read from
 
 	// Read register numbers, in same order as ReadRegNumbers
@@ -343,12 +346,13 @@ private:
 	static constexpr unsigned int ReadDrvStat = 1;
 	static constexpr unsigned int ReadMsCnt = 2;
 	static constexpr unsigned int ReadPwmScale = 3;
+	static constexpr unsigned int ReadPwmAuto = 4;
 
 	static constexpr uint8_t NoRegIndex = 0xFF;				// this means no register updated, or no register requested
 
 	volatile uint32_t writeRegisters[NumWriteRegisters];	// the values we want the TMC22xx writable registers to have
 	volatile uint32_t readRegisters[NumReadRegisters];		// the last values read from the TMC22xx readable registers
-	volatile uint32_t accumulatedReadRegisters[NumReadRegisters];
+	volatile uint32_t accumulatedDriveStatus;				// the accumulated drive status bits
 
 	uint32_t configuredChopConfReg;							// the configured chopper control register, in the Enabled state, without the microstepping bits
 	uint32_t maxStallStepInterval;							// maximum interval between full steps to take any notice of stall detection
@@ -394,7 +398,8 @@ const uint8_t TmcDriverState::ReadRegNumbers[NumReadRegisters] =
 	REGNUM_GSTAT,
 	REGNUM_DRV_STATUS,
 	REGNUM_MSCNT,
-	REGNUM_PWM_SCALE
+	REGNUM_PWM_SCALE,
+	REGNUM_PWM_AUTO
 };
 
 uint16_t TmcDriverState::numTimeouts = 0;								// how many times a transfer timed out
@@ -430,8 +435,9 @@ pre(!driversPowered)
 
 	for (size_t i = 0; i < NumReadRegisters; ++i)
 	{
-		accumulatedReadRegisters[i] = readRegisters[i] = 0;
+		readRegisters[i] = 0;
 	}
+	accumulatedDriveStatus = 0;
 
 	regIndexBeingUpdated = regIndexRequested = previousRegIndexRequested = NoRegIndex;
 	numReads = numWrites = 0;
@@ -501,7 +507,7 @@ unsigned int TmcDriverState::GetMicrostepping(bool& interpolation) const noexcep
 
 bool TmcDriverState::SetRegister(SmartDriverRegister reg, uint32_t regVal) noexcept
 {
-	switch(reg)
+	switch (reg)
 	{
 	case SmartDriverRegister::chopperControl:
 		return SetChopConf(regVal);
@@ -569,6 +575,9 @@ uint32_t TmcDriverState::GetRegister(SmartDriverRegister reg) const noexcept
 
 	case SmartDriverRegister::pwmScale:
 		return readRegisters[ReadPwmScale];
+
+	case SmartDriverRegister::pwmAuto:
+		return readRegisters[ReadPwmAuto];
 
 	case SmartDriverRegister::hdec:
 	default:
@@ -710,8 +719,8 @@ uint32_t TmcDriverState::ReadLiveStatus() const noexcept
 uint32_t TmcDriverState::ReadAccumulatedStatus(uint32_t bitsToKeep) noexcept
 {
 	TaskCriticalSectionLocker lock;
-	const uint32_t status = accumulatedReadRegisters[ReadDrvStat];
-	accumulatedReadRegisters[ReadDrvStat] = (status & bitsToKeep) | readRegisters[ReadDrvStat];		// so that the next call to ReadAccumulatedStatus isn't missing some bits
+	const uint32_t status = accumulatedDriveStatus;
+	accumulatedDriveStatus = (status & bitsToKeep) | readRegisters[ReadDrvStat];		// so that the next call to ReadAccumulatedStatus isn't missing some bits
 	return status & (TMC_RR_SG | TMC_RR_OT | TMC_RR_OTPW | TMC_RR_S2G | TMC_RR_OLA | TMC_RR_OLB | TMC_RR_STST);
 }
 
@@ -721,34 +730,34 @@ void TmcDriverState::AppendDriverStatus(const StringRef& reply, bool clearGlobal
 	const uint32_t lastReadStatus = readRegisters[ReadDrvStat];
 	if (lastReadStatus & TMC_RR_OT)
 	{
-		reply.cat(" temperature-shutdown!");
+		reply.cat("temperature-shutdown! ");
 	}
 	else if (lastReadStatus & TMC_RR_OTPW)
 	{
-		reply.cat(" temperature-warning");
+		reply.cat("temperature-warning, ");
 	}
 	if (lastReadStatus & TMC_RR_S2G)
 	{
-		reply.cat(" short-to-ground");
+		reply.cat("short-to-ground, ");
 	}
 	if ((lastReadStatus & TMC_RR_OLA) && !(lastReadStatus & TMC_RR_STST))
 	{
-		reply.cat(" open-load-A");
+		reply.cat("open-load-A, ");
 	}
 	if ((lastReadStatus & TMC_RR_OLB) && !(lastReadStatus & TMC_RR_STST))
 	{
-		reply.cat(" open-load-B");
+		reply.cat("open-load-B, ");
 	}
 	if (lastReadStatus & TMC_RR_STST)
 	{
-		reply.cat(" standstill");
+		reply.cat("standstill, ");
 	}
 	else if ((lastReadStatus & (TMC_RR_OT | TMC_RR_OTPW | TMC_RR_S2G | TMC_RR_OLA | TMC_RR_OLB)) == 0)
 	{
-		reply.cat(" ok");
+		reply.cat("ok, ");
 	}
 
-	reply.catf(", reads %u, writes %u timeouts %u", numReads, numWrites, numTimeouts);
+	reply.catf("reads %u, writes %u timeouts %u, ", numReads, numWrites, numTimeouts);
 	numReads = numWrites = 0;
 	if (clearGlobalStats)
 	{
@@ -757,11 +766,11 @@ void TmcDriverState::AppendDriverStatus(const StringRef& reply, bool clearGlobal
 
 	if (minSgLoadRegister <= maxSgLoadRegister)
 	{
-		reply.catf(", SG min/max %" PRIu32 "/%" PRIu32, minSgLoadRegister, maxSgLoadRegister);
+		reply.catf("SG min/max %" PRIu32 "/%" PRIu32, minSgLoadRegister, maxSgLoadRegister);
 	}
 	else
 	{
-		reply.cat(", SG min/max not available");
+		reply.cat("SG min/max not available");
 	}
 	ResetLoadRegisters();
 }
@@ -794,9 +803,12 @@ void TmcDriverState::AppendStallConfig(const StringRef& reply) const noexcept
 		threshold -= 128;
 	}
 	const uint32_t fullstepsPerSecond = StepTimer::StepClockRate/maxStallStepInterval;
-	const float speed = ((fullstepsPerSecond << microstepShiftFactor)/reprap.GetPlatform().DriveStepsPerUnit(axisNumber));
-	reply.catf("stall threshold %d, filter %s, steps/sec %" PRIu32 " (%.1f mm/sec), coolstep %" PRIx32,
-				threshold, ((filtered) ? "on" : "off"), fullstepsPerSecond, (double)speed, writeRegisters[WriteCoolConf] & 0xFFFF);
+	const float speed1 = ((fullstepsPerSecond << microstepShiftFactor)/reprap.GetPlatform().DriveStepsPerUnit(axisNumber));
+	const uint32_t tcoolthrs = writeRegisters[WriteTcoolthrs] & ((1ul << 20) - 1u);
+	bool bdummy;
+	const float speed2 = (12000000.0 * GetMicrostepping(bdummy))/(256 * tcoolthrs * reprap.GetPlatform().DriveStepsPerUnit(axisNumber));
+	reply.catf("stall threshold %d, filter %s, steps/sec %" PRIu32 " (%.1f mm/sec), coolstep threshold %" PRIu32 " (%.1f mm/sec)",
+				threshold, ((filtered) ? "on" : "off"), fullstepsPerSecond, (double)speed1, tcoolthrs, (double)speed2);
 }
 
 // In the following, only byte accesses to sendDataBlock are allowed, because accesses to non-cacheable memory must be aligned
@@ -879,12 +891,11 @@ void TmcDriverState::TransferSucceeded(const uint8_t *rcvDataBlock) noexcept
 			const uint32_t oldDrvStat = readRegisters[ReadDrvStat];
 			readRegisters[ReadDrvStat] = regVal;
 			regVal &= oldDrvStat;
-			accumulatedReadRegisters[ReadDrvStat] |= regVal;
+			accumulatedDriveStatus |= regVal;
 		}
 		else
 		{
 			readRegisters[previousRegIndexRequested] = regVal;
-			accumulatedReadRegisters[previousRegIndexRequested] |= regVal;
 		}
 	}
 
@@ -895,7 +906,7 @@ void TmcDriverState::TransferSucceeded(const uint8_t *rcvDataBlock) noexcept
 	   )
 	{
 		readRegisters[ReadDrvStat] |= TMC_RR_SG;
-		accumulatedReadRegisters[ReadDrvStat] |= TMC_RR_SG;
+		accumulatedDriveStatus |= TMC_RR_SG;
 		EndstopOrZProbe::UpdateStalledDrivers(driverBit, true);
 	}
 	else
@@ -1008,7 +1019,7 @@ static void SetupDMA() noexcept
 		xdmac_configure_transfer(XDMAC, DmacChanTmcTx, &p_cfg);
 	}
 
-#elif SAME51
+#elif SAME5x
 	DmacManager::DisableChannel(TmcRxDmaChannel);
 	DmacManager::DisableChannel(TmcTxDmaChannel);
 	DmacManager::SetTriggerSourceSercomRx(TmcRxDmaChannel, SERCOM_TMC51xx_NUMBER);
@@ -1029,7 +1040,7 @@ static inline void EnableDma() noexcept
 #if SAME70
 	xdmac_channel_enable(XDMAC, DmacChanTmcRx);
 	xdmac_channel_enable(XDMAC, DmacChanTmcTx);
-#elif SAME51
+#elif SAME5x
 	DmacManager::EnableChannel(TmcRxDmaChannel, TmcRxDmaPriority);
 	DmacManager::EnableChannel(TmcTxDmaChannel, TmcTxDmaPriority);
 #else
@@ -1042,7 +1053,7 @@ static inline void DisableDma() noexcept
 #if SAME70
 	xdmac_channel_disable(XDMAC, DmacChanTmcTx);
 	xdmac_channel_disable(XDMAC, DmacChanTmcRx);
-#elif SAME51
+#elif SAME5x
 	DmacManager::DisableChannel(TmcTxDmaChannel);
 	DmacManager::DisableChannel(TmcRxDmaChannel);
 #else
@@ -1169,7 +1180,7 @@ extern "C" [[noreturn]] void TmcLoop(void *) noexcept
 			}
 
 			// Kick off a transfer.
-			// On the SAME51 the only way I have found to get reliable transfers and no timeouts is to disable SPI, enable DMA, and then enable SPI.
+			// On the SAME5x the only way I have found to get reliable transfers and no timeouts is to disable SPI, enable DMA, and then enable SPI.
 			// Enabling SPI before DMA sometimes results in timeouts.
 			// Unfortunately, when we disable SPI the SCLK line floats. Therefore we disable SPI for as little time as possible.
 			{
@@ -1188,7 +1199,7 @@ extern "C" [[noreturn]] void TmcLoop(void *) noexcept
 			}
 
 			// Wait for the end-of-transfer interrupt
-			timedOut = TaskBase::Take(TransferTimeout);
+			timedOut = !TaskBase::Take(TransferTimeout);
 			DisableEndOfTransferInterrupt();
 			DisableDma();
 
@@ -1219,7 +1230,7 @@ void SmartDrivers::Init() noexcept
 	pinMode(GlobalTmc51xxEnablePin, OUTPUT_HIGH);
 	pinMode(GlobalTmc51xxCSPin, OUTPUT_HIGH);
 
-#if SAME51 || SAMC21
+#if SAME5x || SAMC21
 	gpio_set_pin_function(TMC51xxMosiPin, TMC51xxMosiPinPeriphMode);
 	gpio_set_pin_function(TMC51xxSclkPin, TMC51xxSclkPinPeriphMode);
 	gpio_set_pin_function(TMC51xxMisoPin, TMC51xxMisoPinPeriphMode);
@@ -1262,16 +1273,16 @@ void SmartDrivers::Init() noexcept
 
 	// Set up the DMA descriptors
 	// We use separate write-back descriptors, so we only need to set this up once
-	DmacManager::SetBtctrl(TmcRxDmaChannel, DMAC_BTCTRL_VALID | DMAC_BTCTRL_EVOSEL_DISABLE | DMAC_BTCTRL_BLOCKACT_INT | DMAC_BTCTRL_BEATSIZE_BYTE
-								| DMAC_BTCTRL_DSTINC | DMAC_BTCTRL_STEPSEL_DST | DMAC_BTCTRL_STEPSIZE_X1);
 	DmacManager::SetSourceAddress(TmcRxDmaChannel, &(SERCOM_TMC51xx->SPI.DATA.reg));
 	DmacManager::SetDestinationAddress(TmcRxDmaChannel, rcvData);
+	DmacManager::SetBtctrl(TmcRxDmaChannel, DMAC_BTCTRL_VALID | DMAC_BTCTRL_EVOSEL_DISABLE | DMAC_BTCTRL_BLOCKACT_INT | DMAC_BTCTRL_BEATSIZE_BYTE
+								| DMAC_BTCTRL_DSTINC | DMAC_BTCTRL_STEPSEL_DST | DMAC_BTCTRL_STEPSIZE_X1);
 	DmacManager::SetDataLength(TmcRxDmaChannel, ARRAY_SIZE(rcvData));
 
-	DmacManager::SetBtctrl(TmcTxDmaChannel, DMAC_BTCTRL_VALID | DMAC_BTCTRL_EVOSEL_DISABLE | DMAC_BTCTRL_BLOCKACT_INT | DMAC_BTCTRL_BEATSIZE_BYTE
-								| DMAC_BTCTRL_SRCINC | DMAC_BTCTRL_STEPSEL_SRC | DMAC_BTCTRL_STEPSIZE_X1);
 	DmacManager::SetSourceAddress(TmcTxDmaChannel, sendData);
 	DmacManager::SetDestinationAddress(TmcTxDmaChannel, &(SERCOM_TMC51xx->SPI.DATA.reg));
+	DmacManager::SetBtctrl(TmcTxDmaChannel, DMAC_BTCTRL_VALID | DMAC_BTCTRL_EVOSEL_DISABLE | DMAC_BTCTRL_BLOCKACT_INT | DMAC_BTCTRL_BEATSIZE_BYTE
+								| DMAC_BTCTRL_SRCINC | DMAC_BTCTRL_STEPSEL_SRC | DMAC_BTCTRL_STEPSIZE_X1);
 	DmacManager::SetDataLength(TmcTxDmaChannel, ARRAY_SIZE(sendData));
 
 	DmacManager::SetInterruptCallback(TmcRxDmaChannel, RxDmaCompleteCallback, 0U);
@@ -1324,16 +1335,17 @@ void SmartDrivers::Init() noexcept
 	xdmac_enable_interrupt(XDMAC, DmacChanTmcRx);
 #endif
 
+	driversState = DriversState::noPower;
 	tmcTask.Create(TmcLoop, "TMC", nullptr, TaskPriority::TmcPriority);
 }
 
-// Shut down the drivers and stop any related interrupts. Don't call Spin() again after calling this as it may re-enable them.
+// Shut down the drivers and stop any related interrupts
 void SmartDrivers::Exit() noexcept
 {
 	digitalWrite(GlobalTmc51xxEnablePin, HIGH);
 	NVIC_DisableIRQ(TMC51xx_SPI_IRQn);
 	tmcTask.TerminateAndUnlink();
-	driversState = DriversState::noPower;
+	driversState = DriversState::shutDown;						// prevent Spin() calls from doing anything
 }
 
 void SmartDrivers::SetAxisNumber(size_t driver, uint32_t axisNumber) noexcept
@@ -1419,7 +1431,6 @@ DriverMode SmartDrivers::GetDriverMode(size_t driver) noexcept
 }
 
 // Flag that the the drivers have been powered up or down
-// Before the first call to this function with 'powered' true, you must call Init()
 void SmartDrivers::Spin(bool powered) noexcept
 {
 	TaskCriticalSectionLocker lock;
@@ -1432,7 +1443,7 @@ void SmartDrivers::Spin(bool powered) noexcept
 			tmcTask.Give();									// wake up the TMC task because the drivers need to be initialised
 		}
 	}
-	else
+	else if (driversState != DriversState::shutDown)
 	{
 		driversState = DriversState::noPower;				// flag that there is no power to the drivers
 		fastDigitalWriteHigh(GlobalTmc51xxEnablePin);		// disable the drivers

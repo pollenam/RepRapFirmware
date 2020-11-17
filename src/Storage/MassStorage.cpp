@@ -3,14 +3,15 @@
 #include <RepRap.h>
 #include <ObjectModel/ObjectModel.h>
 #include <Libraries/Fatfs/diskio.h>
-#include <sd_mmc.h>
 
-#ifndef __LPC17xx__
-# include <sam/drivers/hsmci/hsmci.h>
-#endif
+#include <Libraries/sd_mmc/sd_mmc.h>
 
 // Check that the LFN configuration in FatFS is sufficient
 static_assert(FF_MAX_LFN >= MaxFilenameLength, "FF_MAX_LFN too small");
+
+// Check that the correct number of SD cards is configured in the library
+#include <Libraries/sd_mmc/conf_sd_mmc.h>
+static_assert(SD_MMC_MEM_CNT == NumSdCards);
 
 // A note on using mutexes:
 // Each SD card volume has its own mutex. There is also one for the file table, and one for the find first/find next buffer.
@@ -753,7 +754,7 @@ void MassStorage::Spin() noexcept
 		SdCardInfo& inf = info[card];
 		if (inf.cdPin != NoPin)
 		{
-			if (digitalRead(inf.cdPin))
+			if (IoPort::ReadPin(inf.cdPin))
 			{
 				// Pin state says no card present
 				switch (inf.cardState)
@@ -931,7 +932,7 @@ void MassStorage::Diagnostics(MessageType mtype) noexcept
 # if HAS_HIGH_SPEED_SD
 	// Show the HSMCI CD pin and speed
 	platform.MessageF(mtype, "SD card 0 %s, interface speed: %.1fMBytes/sec\n",
-								(MassStorage::IsCardDetected(0) ? "detected" : "not detected"), (double)((float)hsmci_get_speed() * 0.000001));
+								(IsCardDetected(0) ? "detected" : "not detected"), (double)((float)sd_mmc_get_interface_speed(0) * 0.000001));
 # else
 	platform.MessageF(mtype, "SD card 0 %s\n", (MassStorage::IsCardDetected(0) ? "detected" : "not detected"));
 # endif

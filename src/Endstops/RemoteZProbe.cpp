@@ -49,7 +49,7 @@ uint16_t RemoteZProbe::GetRawReading() const noexcept
 	return (state) ? 1000 : 0;
 }
 
-void RemoteZProbe::SetProbing(bool isProbing) noexcept
+bool RemoteZProbe::SetProbing(bool isProbing) noexcept
 {
 	String<StringLength100> reply;
 	const GCodeResult rslt = CanInterface::ChangeHandleResponseTime(boardAddress, handle, (isProbing) ? ActiveProbeReportInterval : InactiveProbeReportInterval, state, reply.GetRef());
@@ -58,6 +58,7 @@ void RemoteZProbe::SetProbing(bool isProbing) noexcept
 		reply.cat('\n');
 		reprap.GetPlatform().Message(GetGenericMessageType(rslt), reply.c_str());
 	}
+	return rslt == GCodeResult::ok;
 }
 
 // Create a remote Z probe
@@ -75,8 +76,14 @@ GCodeResult RemoteZProbe::Create(const StringRef& pinNames, const StringRef& rep
 		return GCodeResult::error;
 	}
 
-	handle.Set(RemoteInputHandle::typeZprobe, number, 0);
-	return CanInterface::CreateHandle(boardAddress, handle, pinNames.c_str(), 0, ActiveProbeReportInterval, state, reply);
+	RemoteInputHandle h;
+	h.Set(RemoteInputHandle::typeZprobe, number, 0);
+	const GCodeResult rc = CanInterface::CreateHandle(boardAddress, h, pinNames.c_str(), 0, ActiveProbeReportInterval, state, reply);
+	if (rc < GCodeResult::error)						// don't set the handle unless it is valid, or we will get an error when this probe is deleted
+	{
+		handle = h;
+	}
+	return rc;
 }
 
 // Configure an existing remote Z probe

@@ -52,6 +52,9 @@ enum class GCodeState : uint8_t
 	filamentChangePause1,
 	filamentChangePause2,
 
+	filamentErrorPause1,
+	filamentErrorPause2,
+
 	resuming1,
 	resuming2,
 	resuming3,
@@ -100,11 +103,11 @@ enum class GCodeState : uint8_t
 
 #if HAS_MASS_STORAGE
 	timingSDwrite,
+	timingSDread,
 #endif
 
 #if HAS_LINUX_INTERFACE
-	doingUnsupportedCode,
-	doingUserMacro,
+	waitingForAcknowledgement,
 #endif
 
 #if HAS_VOLTAGE_MONITOR
@@ -124,6 +127,12 @@ enum class BlockType : uint8_t
 	ifFalseHadTrue,				// the block immediately after 'elif' when we have already seem a true condition
 	loop						// block inside a 'while' command
 };
+
+#if HAS_LINUX_INTERFACE
+typedef uint8_t FileId;
+
+constexpr FileId NoFileId = 0;
+#endif
 
 // Class to hold the state of gcode execution for some input source
 class GCodeMachineState
@@ -178,19 +187,19 @@ public:
 	FileData fileState;
 #endif
 #if HAS_LINUX_INTERFACE
-	uint32_t fileId;							// virtual file ID to deal with stack push/pops when a file is being cancelled or finished in the wrong stack level
+	FileId fileId;								// virtual ID to distinguish files in different stack levels (only unique per GB)
 #endif
 	ResourceBitmap lockedResources;
 	BlockState blockStates[MaxBlockIndent];
 	uint32_t lineNumber;
 
-	Compatibility compatibility;
 	uint16_t
 		drivesRelative : 1,
 		axesRelative : 1,
 #if HAS_LINUX_INTERFACE
-		isFileFinished : 1,
-		fileError: 1,
+		lastCodeFromSbc : 1,
+		macroStartedByCode : 1,
+		fileFinished : 1,
 #endif
 		doingFileMacro : 1,
 		waitWhileCooling : 1,
@@ -201,13 +210,12 @@ public:
 		runningSystemMacro : 1,					// true if running a system macro file
 		usingInches : 1,						// true if units are inches not mm
 		waitingForAcknowledgement : 1,
-#if HAS_LINUX_INTERFACE
-		waitingForAcknowledgementSent : 1,
-#endif
 		messageAcknowledged : 1,
 		messageCancelled : 1;
 
+	Compatibility compatibility;
 	uint8_t blockNesting;
+	uint16_t stateParameter;					// a parameter, the meaning of which depends on what state we are in
 
 	bool DoingFile() const noexcept;
 	void CloseFile() noexcept;
@@ -216,7 +224,6 @@ public:
 
 #if HAS_LINUX_INTERFACE
 	void SetFileExecuting() noexcept;
-	void SetFileFinished(bool error) noexcept;
 #endif
 
 	bool UsingMachineCoordinates() const noexcept { return g53Active || runningSystemMacro; }

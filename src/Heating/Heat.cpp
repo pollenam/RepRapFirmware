@@ -25,7 +25,9 @@ Licence: GPL
 #include "RepRap.h"
 #include "Sensors/TemperatureSensor.h"
 #include "GCodes/GCodeBuffer/GCodeBuffer.h"
+#include <Tools/Tool.h>
 #include <TaskPriorities.h>
+#include <General/Portability.h>
 
 #if SUPPORT_DHT_SENSOR
 # include "Sensors/DhtSensor.h"
@@ -275,6 +277,14 @@ void Heat::Exit() noexcept
 
 [[noreturn]] void Heat::HeaterTask() noexcept
 {
+#if SUPPORT_CAN_EXPANSION
+	CanMessageBuffer * buf;
+	while ((buf = CanMessageBuffer::Allocate()) == nullptr)
+	{
+		delay(1);
+	}
+#endif
+
 	uint32_t lastWakeTime = xTaskGetTickCount();
 	for (;;)
 	{
@@ -316,44 +326,35 @@ void Heat::Exit() noexcept
 
 #if SUPPORT_CAN_EXPANSION
 		// Broadcast our sensor temperatures
-		CanMessageBuffer * buf = CanMessageBuffer::Allocate();
-		if (buf != nullptr)
+		CanMessageSensorTemperatures * const msg = buf->SetupBroadcastMessage<CanMessageSensorTemperatures>(CanInterface::GetCanAddress());
+		msg->whichSensors = 0;
+		unsigned int sensorsFound = 0;
+		unsigned int currentSensorNumber = 0;
+		for (;;)
 		{
-			CanMessageSensorTemperatures * const msg = buf->SetupBroadcastMessage<CanMessageSensorTemperatures>(CanInterface::GetCanAddress());
-			msg->whichSensors = 0;
-			unsigned int sensorsFound = 0;
-			unsigned int currentSensorNumber = 0;
-			for (;;)
+			const auto sensor = FindSensorAtOrAbove(currentSensorNumber);
+			if (sensor.IsNull())
 			{
-				const auto sensor = FindSensorAtOrAbove(currentSensorNumber);
-				if (sensor.IsNull())
-				{
-					break;
-				}
-				const unsigned int sn = sensor->GetSensorNumber();
-				if (sensor->GetBoardAddress() == CanInterface::GetCanAddress())
-				{
-					msg->whichSensors |= (uint64_t)1u << sn;
-					float temperature;
-					msg->temperatureReports[sensorsFound].errorCode = (uint8_t)sensor->GetLatestTemperature(temperature);
-					msg->temperatureReports[sensorsFound].temperature = temperature;
-					++sensorsFound;
-				}
-				currentSensorNumber = (unsigned int)sn + 1u;
+				break;
 			}
-			if (sensorsFound == 0)
+			const unsigned int sn = sensor->GetSensorNumber();
+			if (sensor->GetBoardAddress() == CanInterface::GetCanAddress())
 			{
-				// Don't send an empty report
-				CanMessageBuffer::Free(buf);
+				msg->whichSensors |= (uint64_t)1u << sn;
+				float temperature;
+				msg->temperatureReports[sensorsFound].errorCode = (uint8_t)sensor->GetLatestTemperature(temperature);
+				msg->temperatureReports[sensorsFound].SetTemperature(temperature);
+				++sensorsFound;
 			}
-			else
-			{
-				buf->dataLength = msg->GetActualDataLength(sensorsFound);
-				CanInterface::SendBroadcast(buf);
-			}
+			currentSensorNumber = (unsigned int)sn + 1u;
+		}
+
+		if (sensorsFound != 0)							// don't send an empty report
+		{
+			buf->dataLength = msg->GetActualDataLength(sensorsFound);
+			CanInterface::SendBroadcastNoFree(buf);
 		}
 #endif
-
 		// Delay until it is time again
 		vTaskDelayUntil(&lastWakeTime, HeatSampleIntervalMillis);
 	}
@@ -487,7 +488,7 @@ GCodeResult Heat::ConfigureHeater(GCodeBuffer& gb, const StringRef& reply)
 		std::swap(oldHeater, heaters[heater]);
 		delete oldHeater;
 
-		const PwmFrequency freq = (gb.Seen('Q')) ? gb.GetPwmFrequency() : DefaultFanPwmFreq;
+		const PwmFrequency freq = (gb.Seen('Q')) ? min<PwmFrequency>(gb.GetPwmFrequency(), MaxHeaterPwmFrequency) : DefaultHeaterPwmFreq;
 
 #if SUPPORT_CAN_EXPANSION
 		Heater * const newHeater = (board != CanId::MasterAddress) ? (Heater *)new RemoteHeater(heater, board) : new LocalHeater(heater);
@@ -727,6 +728,15 @@ void Heat::Standby(int heater, const Tool *tool) noexcept
 	}
 }
 
+void Heat::PrintCoolingFanPwmChanged(unsigned int heater, float pwmChange) const noexcept
+{
+	const auto h = FindHeater(heater);
+	if (h.IsNotNull())
+	{
+		h->PrintCoolingFanPwmChanged(pwmChange);
+	}
+}
+
 GCodeResult Heat::ResetFault(int heater, const StringRef& reply) noexcept
 {
 	// This gets called for all heater numbers when clearing all temperature faults, so don't report an error if the heater was not found
@@ -813,55 +823,81 @@ GCodeResult Heat::ConfigureHeaterMonitoring(size_t heater, GCodeBuffer& gb, cons
 // Process M303
 GCodeResult Heat::TuneHeater(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException)
 {
-	if (gb.Seen('H'))
+	// To tune a heater, a heater number and/or a tool number musty be given
+	FansBitmap fans;
+	int heaterNumber;
+	const bool seenHeater = gb.Seen('H');
+	if (seenHeater)
 	{
-		const unsigned int heater = gb.GetUIValue();
-		const auto h = FindHeater(heater);
-		if (h.IsNotNull())
+		heaterNumber = gb.GetIValue();
+	}
+	const bool seenTool = gb.Seen('T');
+	if (seenTool)
+	{
+		const int toolNumber = gb.GetIValue();
+		const auto tool = reprap.GetTool(toolNumber);
+		if (tool.IsNull())
 		{
-			gb.MustSee('S');
-			const float temperature = gb.GetFValue();
-			const float maxPwm = (gb.Seen('P')) ? gb.GetFValue() : h->GetModel().GetMaxPwm();
-			if (maxPwm < 0.1 || maxPwm > 1.0)
+			reply.printf("tool %d not found", toolNumber);
+			return GCodeResult::error;
+		}
+		if (seenHeater)
+		{
+			if (!tool->UsesHeater(heaterNumber))
 			{
-				reply.copy("Invalid PWM value");
+				reply.printf("tool %d does not use heater %d", toolNumber, heaterNumber);
+				return GCodeResult::error;
 			}
-			else
-			{
-				if (heaterBeingTuned == -1)
-				{
-					heaterBeingTuned = (int8_t)heater;
-					return h->StartAutoTune(temperature, maxPwm, reply);
-				}
-				else
-				{
-					// Trying to start a new auto tune, but we are already tuning a heater
-					reply.printf("Error: cannot start auto tuning heater %u because heater %d is being tuned", heater, heaterBeingTuned);
-				}
-			}
+		}
+		else if (tool->HeaterCount() == 0)
+		{
+			reply.printf("tool %d has no heaters", toolNumber);
+			return GCodeResult::error;
 		}
 		else
 		{
-			reply.printf("Heater %u not found", heater);
+			heaterNumber = tool->Heater(0);
 		}
-		return GCodeResult::error;
+		fans = tool->GetFanMapping();
+	}
+
+	if (seenHeater || seenTool)
+	{
+		if (heaterBeingTuned != -1)
+		{
+			// Trying to start a new auto tune, but we are already tuning a heater
+			reply.printf("Error: cannot start a new auto tune because heater %d is being tuned", heaterBeingTuned);
+			return GCodeResult::error;
+		}
+
+		const auto h = FindHeater(heaterNumber);
+		if (h.IsNull())
+		{
+			reply.printf("Heater %u not found", heaterNumber);
+			return GCodeResult::error;
+		}
+
+		const GCodeResult rslt = h->StartAutoTune(gb, reply, fans);
+		if (rslt <= GCodeResult::warning)
+		{
+			heaterBeingTuned = (int8_t)heaterNumber;
+		}
+		return rslt;
+	}
+
+	// If we get here then neither T nor H was given, so report the auto tune status
+	const int whichPid = (heaterBeingTuned == -1) ? lastHeaterTuned : heaterBeingTuned;
+	const auto h = FindHeater(whichPid);
+
+	if (h.IsNotNull())
+	{
+		h->GetAutoTuneStatus(reply);
 	}
 	else
 	{
-		// Report the auto tune status
-		const int whichPid = (heaterBeingTuned == -1) ? lastHeaterTuned : heaterBeingTuned;
-		const auto h = FindHeater(whichPid);
-
-		if (h.IsNotNull())
-		{
-			h->GetAutoTuneStatus(reply);
-		}
-		else
-		{
-			reply.copy("No heater has been tuned yet");
-		}
-		return GCodeResult::ok;
+		reply.copy("No heater has been tuned since startup");
 	}
+	return GCodeResult::ok;
 }
 
 // Process M308

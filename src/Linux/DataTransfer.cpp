@@ -11,7 +11,44 @@
 
 #include <algorithm>
 
-#include "xdmac/xdmac.h"
+#if defined(DUET_NG) && defined(USE_SBC)
+
+// The PDC seems to be too slow to work reliably without getting transmit underruns, so we use the DMAC now.
+# define USE_DMAC			1		// use general DMA controller
+# define USE_XDMAC			0		// use XDMA controller
+# define USE_DMAC_MANAGER	0		// use SAME5x DmacManager module
+
+#elif defined(DUET3) || defined(SAME70XPLD)
+
+# define USE_DMAC			0		// use general DMA controller
+# define USE_XDMAC			1		// use XDMA controller
+# define USE_DMAC_MANAGER	0		// use SAME5x DmacManager module
+
+#elif defined(DUET3MINI)
+
+# define USE_DMAC			0		// use general DMA controller
+# define USE_XDMAC			0		// use XDMA controller
+# define USE_DMAC_MANAGER	1		// use SAME5x DmacManager module
+constexpr IRQn SBC_SPI_IRQn = SbcSpiSercomIRQn;
+
+#define USE_32BIT_TRANSFERS		1
+
+#else
+# error Unknown board
+#endif
+
+#if USE_DMAC
+# include "dmac/dmac.h"
+# include "matrix/matrix.h"
+#endif
+
+#if USE_XDMAC
+# include "xdmac/xdmac.h"
+#endif
+
+#if USE_DMAC_MANAGER || SAME70
+# include <DmacManager.h>
+#endif
 
 #include "RepRapFirmware.h"
 #include "GCodes/GCodeMachineState.h"
@@ -20,10 +57,22 @@
 #include "ObjectModel/ObjectModel.h"
 #include "OutputMemory.h"
 #include "RepRap.h"
+#include <Cache.h>
 #include "RTOSIface/RTOSIface.h"
-#include "Hardware/DmacManager.h"
 
 #include <General/IP4String.h>
+
+static TaskHandle linuxTaskHandle = nullptr;
+
+#if USE_DMAC
+
+// Hardware IDs of the SPI transmit and receive DMA interfaces. See atsam datasheet.
+const uint32_t SBC_SPI_TX_DMA_HW_ID = 1;
+const uint32_t SBC_SPI_RX_DMA_HW_ID = 2;
+
+#endif
+
+#if USE_XDMAC
 
 // XDMAC hardware, see datasheet
 constexpr uint32_t SBC_SPI_TX_PERID = (uint32_t)DmaTrigSource::spi1tx;
@@ -31,21 +80,76 @@ constexpr uint32_t SBC_SPI_RX_PERID = (uint32_t)DmaTrigSource::spi1rx;
 
 static xdmac_channel_config_t xdmac_tx_cfg, xdmac_rx_cfg;
 
-volatile bool dataReceived = false, transferReadyHigh = false;
+#endif
+
+volatile bool dataReceived = false;				// warning: on the SAME5x this just means the transfer has started, not necessarily that it has ended!
+volatile bool transferReadyHigh = false;
 volatile unsigned int spiTxUnderruns = 0, spiRxOverruns = 0;
 
-static void setup_spi(void *inBuffer, const void *outBuffer, size_t bytesToTransfer) noexcept
+static void spi_dma_disable() noexcept
 {
-	// Reset SPI
-	spi_reset(SBC_SPI);
-	spi_set_slave_mode(SBC_SPI);
-	spi_disable_mode_fault_detect(SBC_SPI);
-	spi_set_peripheral_chip_select_value(SBC_SPI, spi_get_pcs(0));
-	spi_set_clock_polarity(SBC_SPI, 0, 0);
-	spi_set_clock_phase(SBC_SPI, 0, 1);
-	spi_set_bits_per_transfer(SBC_SPI, 0, SPI_CSR_BITS_8_BIT);
+#if USE_DMAC
+	dmac_channel_disable(DMAC, DmacChanSbcRx);
+	dmac_channel_disable(DMAC, DmacChanSbcTx);
+#endif
 
-	// Initialize channel config for transmitter
+#if USE_XDMAC
+	xdmac_channel_disable(XDMAC, DmacChanSbcRx);
+	xdmac_channel_disable(XDMAC, DmacChanSbcTx);
+#endif
+
+#if USE_DMAC_MANAGER
+	DmacManager::DisableChannel(DmacChanSbcRx);
+	DmacManager::DisableChannel(DmacChanSbcTx);
+#endif
+}
+
+#if !SAME5x
+
+static bool spi_dma_check_rx_complete() noexcept
+{
+#if USE_DMAC
+	const uint32_t status = DMAC->DMAC_CHSR;
+	if (   ((status & (DMAC_CHSR_ENA0 << DmacChanSbcRx)) == 0)	// controller is not enabled, perhaps because it finished a full buffer transfer
+		|| ((status & (DMAC_CHSR_EMPT0 << DmacChanSbcRx)) != 0)	// controller is enabled, probably suspended, and the FIFO is empty
+	   )
+	{
+		// Disable the channel.
+		// We also need to set the resume bit, otherwise it remains suspended when we re-enable it.
+		DMAC->DMAC_CHDR = (DMAC_CHDR_DIS0 << DmacChanSbcRx) | (DMAC_CHDR_RES0 << DmacChanSbcRx);
+		return true;
+	}
+	return false;
+
+#elif USE_XDMAC
+	return (xdmac_channel_get_status(XDMAC) & ((1 << DmacChanSbcRx) | (1 << DmacChanSbcTx))) == 0;
+#endif
+}
+
+#endif
+
+// Set up the transmit DMA but don't enable it
+static void spi_tx_dma_setup(const void *outBuffer, size_t bytesToTransfer) noexcept
+{
+#if USE_DMAC
+	DMAC->DMAC_EBCISR;		// clear any pending interrupts
+
+	dmac_channel_set_source_addr(DMAC, DmacChanSbcTx, reinterpret_cast<uint32_t>(outBuffer));
+	dmac_channel_set_destination_addr(DMAC, DmacChanSbcTx, reinterpret_cast<uint32_t>(&(SBC_SPI->SPI_TDR)));
+	dmac_channel_set_descriptor_addr(DMAC, DmacChanSbcTx, 0);
+	dmac_channel_set_ctrlA(DMAC, DmacChanSbcTx,
+			bytesToTransfer |
+			DMAC_CTRLA_SRC_WIDTH_WORD |
+			DMAC_CTRLA_DST_WIDTH_BYTE);
+	dmac_channel_set_ctrlB(DMAC, DmacChanSbcTx,
+		DMAC_CTRLB_SRC_DSCR |
+		DMAC_CTRLB_DST_DSCR |
+		DMAC_CTRLB_FC_MEM2PER_DMA_FC |
+		DMAC_CTRLB_SRC_INCR_INCREMENTING |
+		DMAC_CTRLB_DST_INCR_FIXED);
+#endif
+
+#if USE_XDMAC
 	xdmac_tx_cfg.mbr_ubc = bytesToTransfer;
 	xdmac_tx_cfg.mbr_sa = (uint32_t)outBuffer;
 	xdmac_tx_cfg.mbr_da = (uint32_t)&(SBC_SPI->SPI_TDR);
@@ -63,13 +167,48 @@ static void setup_spi(void *inBuffer, const void *outBuffer, size_t bytesToTrans
 	xdmac_tx_cfg.mbr_ds = 0;
 	xdmac_tx_cfg.mbr_sus = 0;
 	xdmac_tx_cfg.mbr_dus = 0;
-	xdmac_configure_transfer(XDMAC, DmacChanLinuxTx, &xdmac_tx_cfg);
+	xdmac_configure_transfer(XDMAC, DmacChanSbcTx, &xdmac_tx_cfg);
 
-	xdmac_channel_set_descriptor_control(XDMAC, DmacChanLinuxTx, 0);
-	xdmac_channel_enable(XDMAC, DmacChanLinuxTx);
-	xdmac_disable_interrupt(XDMAC, DmacChanLinuxTx);
+	xdmac_channel_set_descriptor_control(XDMAC, DmacChanSbcTx, 0);
+	xdmac_disable_interrupt(XDMAC, DmacChanSbcTx);
+#endif
 
-	// Initialize channel config for receiver
+#if USE_DMAC_MANAGER
+	DmacManager::SetSourceAddress(DmacChanSbcTx, outBuffer);
+	DmacManager::SetDestinationAddress(DmacChanSbcTx, &(SbcSpiSercom->SPI.DATA.reg));
+# if USE_32BIT_TRANSFERS
+	DmacManager::SetBtctrl(DmacChanSbcTx, DMAC_BTCTRL_STEPSIZE_X1 | DMAC_BTCTRL_STEPSEL_SRC | DMAC_BTCTRL_SRCINC | DMAC_BTCTRL_BEATSIZE_WORD | DMAC_BTCTRL_BLOCKACT_NOACT);
+	DmacManager::SetDataLength(DmacChanSbcTx, (bytesToTransfer + 3) >> 2);			// must do this one last
+# else
+	DmacManager::SetBtctrl(DmacChanSbcTx, DMAC_BTCTRL_STEPSIZE_X1 | DMAC_BTCTRL_STEPSEL_SRC | DMAC_BTCTRL_SRCINC | DMAC_BTCTRL_BEATSIZE_BYTE | DMAC_BTCTRL_BLOCKACT_NOACT);
+	DmacManager::SetDataLength(DmacChanSbcTx, bytesToTransfer);						// must do this one last
+# endif
+	DmacManager::SetTriggerSourceSercomTx(DmacChanSbcTx, SbcSpiSercomNumber);
+#endif
+}
+
+// Set up the receive DMA but don't enable it
+static void spi_rx_dma_setup(void *inBuffer, size_t bytesToTransfer) noexcept
+{
+#if USE_DMAC
+	DMAC->DMAC_EBCISR;		// clear any pending interrupts
+
+	dmac_channel_set_source_addr(DMAC, DmacChanSbcRx, reinterpret_cast<uint32_t>(&(SBC_SPI->SPI_RDR)));
+	dmac_channel_set_destination_addr(DMAC, DmacChanSbcRx, reinterpret_cast<uint32_t>(inBuffer));
+	dmac_channel_set_descriptor_addr(DMAC, DmacChanSbcRx, 0);
+	dmac_channel_set_ctrlA(DMAC, DmacChanSbcRx,
+			bytesToTransfer |
+			DMAC_CTRLA_SRC_WIDTH_BYTE |
+			DMAC_CTRLA_DST_WIDTH_WORD);
+	dmac_channel_set_ctrlB(DMAC, DmacChanSbcRx,
+		DMAC_CTRLB_SRC_DSCR |
+		DMAC_CTRLB_DST_DSCR |
+		DMAC_CTRLB_FC_PER2MEM_DMA_FC |
+		DMAC_CTRLB_SRC_INCR_FIXED |
+		DMAC_CTRLB_DST_INCR_INCREMENTING);
+#endif
+
+#if USE_XDMAC
 	xdmac_rx_cfg.mbr_ubc = bytesToTransfer;
 	xdmac_rx_cfg.mbr_da = (uint32_t)inBuffer;
 	xdmac_rx_cfg.mbr_sa = (uint32_t)&(SBC_SPI->SPI_RDR);
@@ -87,34 +226,116 @@ static void setup_spi(void *inBuffer, const void *outBuffer, size_t bytesToTrans
 	xdmac_tx_cfg.mbr_ds = 0;
 	xdmac_rx_cfg.mbr_sus = 0;
 	xdmac_rx_cfg.mbr_dus = 0;
-	xdmac_configure_transfer(XDMAC, DmacChanLinuxRx, &xdmac_rx_cfg);
+	xdmac_configure_transfer(XDMAC, DmacChanSbcRx, &xdmac_rx_cfg);
 
-	xdmac_channel_set_descriptor_control(XDMAC, DmacChanLinuxRx, 0);
-	xdmac_channel_enable(XDMAC, DmacChanLinuxRx);
-	xdmac_disable_interrupt(XDMAC, DmacChanLinuxRx);
+	xdmac_channel_set_descriptor_control(XDMAC, DmacChanSbcRx, 0);
+	xdmac_disable_interrupt(XDMAC, DmacChanSbcRx);
+#endif
 
-	// Enable SPI and notify the RaspPi we are ready
+#if USE_DMAC_MANAGER
+	DmacManager::SetSourceAddress(DmacChanSbcRx, &(SbcSpiSercom->SPI.DATA.reg));
+	DmacManager::SetDestinationAddress(DmacChanSbcRx, inBuffer);
+# if USE_32BIT_TRANSFERS
+	DmacManager::SetBtctrl(DmacChanSbcRx, DMAC_BTCTRL_STEPSIZE_X1 | DMAC_BTCTRL_STEPSEL_DST | DMAC_BTCTRL_DSTINC | DMAC_BTCTRL_BEATSIZE_WORD | DMAC_BTCTRL_BLOCKACT_INT);
+	DmacManager::SetDataLength(DmacChanSbcRx, (bytesToTransfer + 3) >> 2);			// must do this one last
+# else
+	DmacManager::SetBtctrl(DmacChanSbcRx, DMAC_BTCTRL_STEPSIZE_X1 | DMAC_BTCTRL_STEPSEL_DST | DMAC_BTCTRL_DSTINC | DMAC_BTCTRL_BEATSIZE_BYTE | DMAC_BTCTRL_BLOCKACT_INT);
+	DmacManager::SetDataLength(DmacChanSbcRx, bytesToTransfer);						// must do this one last
+# endif
+	DmacManager::SetTriggerSourceSercomRx(DmacChanSbcRx, SbcSpiSercomNumber);
+#endif
+}
+
+/**
+ * \brief Set SPI slave transfer.
+ */
+static void spi_slave_dma_setup(void *inBuffer, const void *outBuffer, size_t bytesToTransfer) noexcept
+{
+	spi_dma_disable();
+	spi_tx_dma_setup(outBuffer, bytesToTransfer);
+	spi_rx_dma_setup(inBuffer, bytesToTransfer);
+
+#if USE_DMAC
+	dmac_channel_enable(DMAC, DmacChanSbcRx);
+	dmac_channel_enable(DMAC, DmacChanSbcTx);
+#endif
+
+#if USE_XDMAC
+	xdmac_channel_enable(XDMAC, DmacChanSbcRx);
+	xdmac_channel_enable(XDMAC, DmacChanSbcTx);
+#endif
+
+#if USE_DMAC_MANAGER
+	DmacManager::EnableChannel(DmacChanSbcRx, DmacPrioSbc);
+	DmacManager::EnableChannel(DmacChanSbcTx, DmacPrioSbc);
+#endif
+}
+
+static void setup_spi(void *inBuffer, const void *outBuffer, size_t bytesToTransfer) noexcept
+{
+#if !SAME5x
+	// Reset SPI
+	spi_reset(SBC_SPI);
+	spi_set_slave_mode(SBC_SPI);
+	spi_disable_mode_fault_detect(SBC_SPI);
+	spi_set_peripheral_chip_select_value(SBC_SPI, spi_get_pcs(0));
+	spi_set_clock_polarity(SBC_SPI, 0, 0);
+	spi_set_clock_phase(SBC_SPI, 0, 1);
+	spi_set_bits_per_transfer(SBC_SPI, 0, SPI_CSR_BITS_8_BIT);
+#endif
+
+	// Initialize channel config for transmitter and receiver
+	spi_slave_dma_setup(inBuffer, outBuffer, bytesToTransfer);
+
+#if USE_DMAC
+	// Configure DMA RX channel
+	dmac_channel_set_configuration(DMAC, DmacChanSbcRx,
+			DMAC_CFG_SRC_PER(SBC_SPI_RX_DMA_HW_ID) |
+			DMAC_CFG_SRC_H2SEL |
+			DMAC_CFG_SOD |
+			DMAC_CFG_FIFOCFG_ASAP_CFG);
+
+	// Configure DMA TX channel
+	dmac_channel_set_configuration(DMAC, DmacChanSbcTx,
+			DMAC_CFG_DST_PER(SBC_SPI_TX_DMA_HW_ID) |
+			DMAC_CFG_DST_H2SEL |
+			DMAC_CFG_SOD |
+			DMAC_CFG_FIFOCFG_ASAP_CFG);
+#endif
+
+	// Enable SPI and notify the SBC we are ready
+#if SAME5x
+	SbcSpiSercom->SPI.INTFLAG.reg = 0xFF;			// clear any pending interrupts
+	SbcSpiSercom->SPI.INTENSET.reg = SERCOM_SPI_INTENSET_SSL;	// enable the start of transfer (SS low) interrupt
+	SbcSpiSercom->SPI.CTRLA.reg |= SERCOM_SPI_CTRLA_ENABLE;
+	while (SbcSpiSercom->SPI.SYNCBUSY.reg & (SERCOM_SPI_SYNCBUSY_SWRST | SERCOM_SPI_SYNCBUSY_ENABLE)) { };
+#else
 	spi_enable(SBC_SPI);
 
 	// Enable end-of-transfer interrupt
 	(void)SBC_SPI->SPI_SR;							// clear any pending interrupt
 	SBC_SPI->SPI_IER = SPI_IER_NSSR;				// enable the NSS rising interrupt
+#endif
+
 	NVIC_SetPriority(SBC_SPI_IRQn, NvicPrioritySpi);
 	NVIC_EnableIRQ(SBC_SPI_IRQn);
 
 	// Begin transfer
 	transferReadyHigh = !transferReadyHigh;
-	digitalWrite(LinuxTfrReadyPin, transferReadyHigh);
+	digitalWrite(SbcTfrReadyPin, transferReadyHigh);
 }
 
 void disable_spi() noexcept
 {
-	// Disable the XDMAC channels
-	xdmac_channel_disable(XDMAC, DmacChanLinuxRx);
-	xdmac_channel_disable(XDMAC, DmacChanLinuxTx);
+	spi_dma_disable();
 
 	// Disable SPI
+#if SAME5x
+	SbcSpiSercom->SPI.CTRLA.reg &= ~SERCOM_SPI_CTRLA_ENABLE;
+	while (SbcSpiSercom->SPI.SYNCBUSY.reg & (SERCOM_SPI_SYNCBUSY_SWRST | SERCOM_SPI_SYNCBUSY_ENABLE)) { };
+#else
 	spi_disable(SBC_SPI);
+#endif
 }
 
 #ifndef SBC_SPI_HANDLER
@@ -123,13 +344,25 @@ void disable_spi() noexcept
 
 extern "C" void SBC_SPI_HANDLER() noexcept
 {
+#if SAME5x
+	// On the SAM5x we can't get an end-of-transfer interrupt, only a start-of-transfer interrupt.
+	// So we can't disable SPI or DMA in this ISR.
+	const uint8_t status = SbcSpiSercom->SPI.INTFLAG.reg;
+	if ((status & SERCOM_SPI_INTENSET_SSL) != 0)
+	{
+		SbcSpiSercom->SPI.INTENCLR.reg = SERCOM_SPI_INTENSET_SSL;		// disable the interrupt
+		SbcSpiSercom->SPI.INTFLAG.reg = SERCOM_SPI_INTENSET_SSL;		// clear the status
+
+		dataReceived = true;
+		TaskBase::GiveFromISR(linuxTaskHandle);
+	}
+#else
 	const uint32_t status = SBC_SPI->SPI_SR;							// read status and clear interrupt
 	SBC_SPI->SPI_IDR = SPI_IER_NSSR;									// disable the interrupt
 	if ((status & SPI_SR_NSSR) != 0)
 	{
 		// Data has been transferred, disable transfer ready pin and XDMAC channels
 		disable_spi();
-		dataReceived = true;
 
 		// Check if any error occurred
 		if ((status & SPI_SR_OVRES) != 0)
@@ -140,24 +373,36 @@ extern "C" void SBC_SPI_HANDLER() noexcept
 		{
 			++spiTxUnderruns;
 		}
+
+		// Wake up the Linux task
+		dataReceived = true;
+		TaskBase::GiveFromISR(linuxTaskHandle);
 	}
+#endif
 }
 
 /*-----------------------------------------------------------------------------------*/
 
 // Static data. Note, the startup code we use doesn't make any provision for initialising non-cached memory, other than to zero. So don't specify initial value here
+
+#if SAME70
 __nocache TransferHeader DataTransfer::rxHeader;
 __nocache TransferHeader DataTransfer::txHeader;
 __nocache uint32_t DataTransfer::rxResponse;
 __nocache uint32_t DataTransfer::txResponse;
-__nocache uint32_t DataTransfer::rxBuffer32[LinuxTransferBufferSize / 4];
-__nocache uint32_t DataTransfer::txBuffer32[LinuxTransferBufferSize / 4];
+alignas(4) __nocache char DataTransfer::rxBuffer[LinuxTransferBufferSize];
+alignas(4) __nocache char DataTransfer::txBuffer[LinuxTransferBufferSize];
+#endif
 
 DataTransfer::DataTransfer() noexcept : state(SpiState::ExchangingData), lastTransferTime(0), lastTransferNumber(0), failedTransfers(0),
+#if SAME5x
+	rxBuffer(nullptr), txBuffer(nullptr),
+#endif
 	rxPointer(0), txPointer(0), packetId(0)
 {
 	rxResponse = TransferResponse::Success;
 	txResponse = TransferResponse::Success;
+
 	// Prepare RX header
 	rxHeader.sequenceNumber = 0;
 
@@ -171,20 +416,48 @@ DataTransfer::DataTransfer() noexcept : state(SpiState::ExchangingData), lastTra
 void DataTransfer::Init() noexcept
 {
 	// Initialise transfer ready pin
-	pinMode(LinuxTfrReadyPin, OUTPUT_LOW);
+	pinMode(SbcTfrReadyPin, OUTPUT_LOW);
 
-	// Initialize SPI pins
+#if !SAME70
+	// Allocate buffers
+	rxBuffer = (char *)new uint32_t[(LinuxTransferBufferSize + 3)/4];
+	txBuffer = (char *)new uint32_t[(LinuxTransferBufferSize + 3)/4];
+#endif
+
+#if SAME5x
+	// Initialize SPI
+	for (Pin p : SbcSpiSercomPins)
+	{
+		SetPinFunction(p, SbcSpiSercomPinsMode);
+	}
+
+	Serial::EnableSercomClock(SbcSpiSercomNumber);
+	spi_dma_disable();
+
+	SbcSpiSercom->SPI.CTRLA.reg |= SERCOM_SPI_CTRLA_SWRST;
+	while (SbcSpiSercom->SPI.SYNCBUSY.reg & SERCOM_SPI_SYNCBUSY_SWRST) { };
+	SbcSpiSercom->SPI.CTRLA.reg = SERCOM_SPI_CTRLA_DIPO(3) | SERCOM_SPI_CTRLA_DOPO(0) | SERCOM_SPI_CTRLA_MODE(2);
+	SbcSpiSercom->SPI.CTRLB.reg = SERCOM_SPI_CTRLB_RXEN | SERCOM_SPI_CTRLB_SSDE | SERCOM_SPI_CTRLB_PLOADEN;
+	while (SbcSpiSercom->SPI.SYNCBUSY.reg & SERCOM_SPI_SYNCBUSY_MASK) { };
+# if USE_32BIT_TRANSFERS
+	SbcSpiSercom->SPI.CTRLC.reg = SERCOM_SPI_CTRLC_DATA32B;
+# else
+	hri_sercomspi_write_CTRLC_reg(SbcSpiSercom, 0);
+# endif
+#else
+	// Initialize SPI
 	ConfigurePin(APIN_SBC_SPI_MOSI);
 	ConfigurePin(APIN_SBC_SPI_MISO);
 	ConfigurePin(APIN_SBC_SPI_SCK);
 	ConfigurePin(APIN_SBC_SPI_SS0);
 
-	// Initialise SPI
 	spi_enable_clock(SBC_SPI);
 	spi_disable(SBC_SPI);
+#endif
+
 	dataReceived = false;
 
-#if false
+#if false // if SAME70
 	// This does not seem to change anything...
 	// The XDMAC is master 4+5 and the SRAM is slave 0+1. Give the XDMAC the highest priority.
 	matrix_set_slave_default_master_type(0, MATRIX_DEFMSTR_LAST_DEFAULT_MASTER);
@@ -196,6 +469,25 @@ void DataTransfer::Init() noexcept
 	matrix_set_slave_slot_cycle(0, 8);
 	matrix_set_slave_slot_cycle(1, 8);
 #endif
+#if USE_DMAC
+	pmc_enable_periph_clk(ID_DMAC);
+	dmac_init(DMAC);
+	dmac_set_priority_mode(DMAC, DMAC_PRIORITY_ROUND_ROBIN);
+	dmac_enable(DMAC);
+
+	// The DMAC is master 4 and the SRAM is slave 0. Give the DMAC the highest priority.
+	matrix_set_slave_default_master_type(0, MATRIX_DEFMSTR_LAST_DEFAULT_MASTER);
+	matrix_set_slave_priority(0, (3 << MATRIX_PRAS0_M4PR_Pos));
+	// Set the slave slot cycle limit.
+	// If we leave it at the default value of 511 clock cycles, we get transmit underruns due to the HSMCI using the bus for too long.
+	// A value of 8 seems to work. I haven't tried other values yet.
+	matrix_set_slave_slot_cycle(0, 8);
+#endif
+}
+
+void DataTransfer::SetLinuxTask(TaskHandle handle) noexcept
+{
+	linuxTaskHandle = handle;
 }
 
 void DataTransfer::Diagnostics(MessageType mtype) noexcept
@@ -213,21 +505,21 @@ const PacketHeader *DataTransfer::ReadPacket() noexcept
 		return nullptr;
 	}
 
-	const PacketHeader *header = reinterpret_cast<const PacketHeader*>(rxBuffer() + rxPointer);
+	const PacketHeader *header = reinterpret_cast<const PacketHeader*>(rxBuffer + rxPointer);
 	rxPointer += sizeof(PacketHeader);
 	return header;
 }
 
 const char *DataTransfer::ReadData(size_t dataLength) noexcept
 {
-	const char *data = rxBuffer() + rxPointer;
+	const char *data = rxBuffer + rxPointer;
 	rxPointer += AddPadding(dataLength);
 	return data;
 }
 
 template<typename T> const T *DataTransfer::ReadDataHeader() noexcept
 {
-	const T *header = reinterpret_cast<const T*>(rxBuffer() + rxPointer);
+	const T *header = reinterpret_cast<const T*>(rxBuffer + rxPointer);
 	rxPointer += sizeof(T);
 	return header;
 }
@@ -264,7 +556,7 @@ void DataTransfer::ReadPrintStartedInfo(size_t packetLength, StringRef& filename
 	memset(info.filamentNeeded, 0, ARRAY_SIZE(info.filamentNeeded) * sizeof(float));
 	const char *data = ReadData(packetLength - sizeof(PrintStartedHeader));
 	size_t filamentsSize = info.numFilaments * sizeof(float);
-	memcpy(info.filamentNeeded, data, filamentsSize);
+	memcpyf(info.filamentNeeded, reinterpret_cast<const float *>(data), info.numFilaments);
 	data += filamentsSize;
 
 	// Read file name
@@ -288,40 +580,45 @@ GCodeChannel DataTransfer::ReadMacroCompleteInfo(bool &error) noexcept
 	return GCodeChannel(header->channel);
 }
 
-void DataTransfer::ReadHeightMap() noexcept
+bool DataTransfer::ReadHeightMap() noexcept
 {
-	// Read heightmap header
+	// Read height map header
 	const HeightMapHeader * const header = ReadDataHeader<HeightMapHeader>();
 	float xRange[2] = { header->xMin, header->xMax };
 	float yRange[2] = { header->yMin, header->yMax };
 	float spacing[2] = { header->xSpacing, header->ySpacing };
-	reprap.GetGCodes().AssignGrid(xRange, yRange, header->radius, spacing);
-
-	// Read Z coordinates
-	const size_t numPoints = header->numX * header->numY;
-	const float *points = reinterpret_cast<const float *>(ReadData(sizeof(float) * numPoints));
-
-	HeightMap& map = reprap.GetMove().AccessHeightMap();
-	map.ClearGridHeights();
-	for (size_t i = 0; i < numPoints; i++)
+	const bool ok = reprap.GetGCodes().AssignGrid(xRange, yRange, header->radius, spacing);
+	if (ok)
 	{
-		if (!isnan(points[i]))
+		// Read Z coordinates
+		const size_t numPoints = header->numX * header->numY;
+		const float *points = reinterpret_cast<const float *>(ReadData(sizeof(float) * numPoints));
+
+		HeightMap& map = reprap.GetMove().AccessHeightMap();
+		map.ClearGridHeights();
+		for (size_t i = 0; i < numPoints; i++)
 		{
-			map.SetGridHeight(i, points[i]);
+			if (!std::isnan(points[i]))
+			{
+				map.SetGridHeight(i, points[i]);
+			}
+		}
+
+		map.ExtrapolateMissing();
+
+		// Activate it
+		reprap.GetGCodes().ActivateHeightmap(true);
+
+		// Recalculate the deviations
+		float minError, maxError;
+		Deviation deviation;
+		const uint32_t numPointsProbed = reprap.GetMove().AccessHeightMap().GetStatistics(deviation, minError, maxError);
+		if (numPointsProbed >= 4)
+		{
+			reprap.GetMove().SetLatestMeshDeviation(deviation);
 		}
 	}
-
-	// Activate it
-	reprap.GetGCodes().ActivateHeightmap(true);
-
-	// Recalculate the deviations
-	float minError, maxError;
-	Deviation deviation;
-	const uint32_t numPointsProbed = reprap.GetMove().AccessHeightMap().GetStatistics(deviation, minError, maxError);
-	if (numPointsProbed >= 4)
-	{
-		reprap.GetMove().SetLatestMeshDeviation(deviation);
-	}
+	return ok;
 }
 
 GCodeChannel DataTransfer::ReadCodeChannel() noexcept
@@ -396,7 +693,7 @@ void DataTransfer::ExchangeData() noexcept
 {
 	size_t bytesToExchange = max<size_t>(rxHeader.dataLength, txHeader.dataLength);
 	state = SpiState::ExchangingData;
-	setup_spi(rxBuffer(), txBuffer(), bytesToExchange);
+	setup_spi(rxBuffer, txBuffer, bytesToExchange);
 }
 
 void DataTransfer::ResetTransfer(bool ownRequest) noexcept
@@ -425,11 +722,25 @@ bool DataTransfer::IsReady() noexcept
 {
 	if (dataReceived)
 	{
-		// Wait for the current XDMA transfer to finish. Relying on the XDMAC IRQ for this is does not work well...
-		if ((xdmac_channel_get_status(XDMAC) & ((1 << DmacChanLinuxRx) | (1 << DmacChanLinuxTx))) != 0)
+#if SAME5x
+		if (!digitalRead(SbcSSPin))			// transfer is complete if SS is high
 		{
 			return false;
 		}
+
+		if (SbcSpiSercom->SPI.STATUS.bit.BUFOVF)
+		{
+			++spiRxOverruns;
+		}
+
+		disable_spi();
+#else
+		// Wait for the current XDMA transfer to finish. Relying on the XDMAC IRQ for this is does not work well...
+		if (!spi_dma_check_rx_complete())
+		{
+			return false;
+		}
+#endif
 
 		// Transfer has finished
 		dataReceived = false;
@@ -439,6 +750,9 @@ bool DataTransfer::IsReady() noexcept
 		{
 		case SpiState::ExchangingHeader:
 		{
+#if SAME5x
+			Cache::InvalidateAfterDMAReceive(&rxHeader, sizeof(rxHeader));
+#endif
 			// (1) Exchanged transfer headers
 			const uint32_t headerResponse = *reinterpret_cast<const uint32_t*>(&rxHeader);
 			if (headerResponse == TransferResponse::BadResponse)
@@ -481,6 +795,9 @@ bool DataTransfer::IsReady() noexcept
 
 		case SpiState::ExchangingHeaderResponse:
 			// (2) Exchanged response to transfer header
+#if SAME5x
+			Cache::InvalidateAfterDMAReceive(&rxResponse, sizeof(rxResponse));
+#endif
 			if (rxResponse == TransferResponse::Success && txResponse == TransferResponse::Success)
 			{
 				if (rxHeader.dataLength != 0 || txHeader.dataLength != 0)
@@ -516,8 +833,11 @@ bool DataTransfer::IsReady() noexcept
 
 		case SpiState::ExchangingData:
 		{
+#if SAME5x
+			Cache::InvalidateAfterDMAReceive(rxBuffer, LinuxTransferBufferSize);
+#endif
 			// (3) Exchanged data
-			if (rxBuffer32[0] == TransferResponse::BadResponse)
+			if (*reinterpret_cast<uint32_t*>(rxBuffer) == TransferResponse::BadResponse)
 			{
 				if (reprap.Debug(moduleLinuxInterface))
 				{
@@ -527,7 +847,7 @@ bool DataTransfer::IsReady() noexcept
 				break;
 			}
 
-			const uint16_t checksum = CRC16(rxBuffer(), rxHeader.dataLength);
+			const uint16_t checksum = CRC16(rxBuffer, rxHeader.dataLength);
 			if (rxHeader.checksumData != checksum)
 			{
 				if (reprap.Debug(moduleLinuxInterface))
@@ -544,6 +864,9 @@ bool DataTransfer::IsReady() noexcept
 
 		case SpiState::ExchangingDataResponse:
 			// (4) Exchanged response to data transfer
+#if SAME5x
+			Cache::InvalidateAfterDMAReceive(&rxResponse, sizeof(rxResponse));
+#endif
 			if (rxResponse == TransferResponse::Success && txResponse == TransferResponse::Success)
 			{
 				// Everything OK
@@ -598,7 +921,7 @@ bool DataTransfer::IsReady() noexcept
 		if (!transferReadyHigh)
 		{
 			transferReadyHigh = true;
-			digitalWrite(LinuxTfrReadyPin, true);
+			digitalWrite(SbcTfrReadyPin, true);
 		}
 	}
 	return false;
@@ -620,7 +943,7 @@ void DataTransfer::StartNextTransfer() noexcept
 	txHeader.numPackets = packetId;
 	txHeader.sequenceNumber++;
 	txHeader.dataLength = txPointer;
-	txHeader.checksumData = CRC16(txBuffer(), txPointer);
+	txHeader.checksumData = CRC16(txBuffer, txPointer);
 	txHeader.checksumHeader = CRC16(reinterpret_cast<const char *>(&txHeader), sizeof(TransferHeader) - sizeof(uint16_t));
 
 	// Begin SPI transfer
@@ -724,7 +1047,7 @@ bool DataTransfer::WriteCodeReply(MessageType type, OutputBuffer *&response) noe
 	return true;
 }
 
-bool DataTransfer::WriteMacroRequest(GCodeChannel channel, const char *filename, bool reportMissing, bool fromCode) noexcept
+bool DataTransfer::WriteMacroRequest(GCodeChannel channel, const char *filename, bool fromCode) noexcept
 {
 	size_t filenameLength = strlen(filename);
 	if (!CanWritePacket(sizeof(ExecuteMacroHeader) + filenameLength))
@@ -738,7 +1061,7 @@ bool DataTransfer::WriteMacroRequest(GCodeChannel channel, const char *filename,
 	// Write header
 	ExecuteMacroHeader *header = WriteDataHeader<ExecuteMacroHeader>();
 	header->channel = channel.RawValue();
-	header->reportMissing = reportMissing;
+	header->dummy = 0;
 	header->fromCode = fromCode;
 	header->length = filenameLength;
 
@@ -762,6 +1085,24 @@ bool DataTransfer::WriteAbortFileRequest(GCodeChannel channel, bool abortAll) no
 	header->channel = channel.RawValue();
 	header->abortAll = abortAll;
 	header->padding = 0;
+	return true;
+}
+
+bool DataTransfer::WriteMacroFileClosed(GCodeChannel channel) noexcept
+{
+	if (!CanWritePacket(sizeof(CodeChannelHeader)))
+	{
+		return false;
+	}
+
+	// Write packet header
+	WritePacketHeader(FirmwareRequest::MacroFileClosed, sizeof(CodeChannelHeader));
+
+	// Write header
+	CodeChannelHeader *header = WriteDataHeader<CodeChannelHeader>();
+	header->channel = channel.RawValue();
+	header->paddingA = 0;
+	header->paddingB = 0;
 	return true;
 }
 
@@ -812,7 +1153,7 @@ bool DataTransfer::WriteHeightMap() noexcept
 	// Write Z points
 	if (numPoints != 0)
 	{
-		float *zPoints = reinterpret_cast<float*>(txBuffer() + txPointer);
+		float *zPoints = reinterpret_cast<float*>(txBuffer + txPointer);
 		reprap.GetMove().SaveHeightMapToArray(zPoints);
 		txPointer += numPoints * sizeof(float);
 	}
@@ -861,7 +1202,9 @@ bool DataTransfer::WriteFileChunkRequest(const char *filename, uint32_t offset, 
 bool DataTransfer::WriteEvaluationResult(const char *expression, const ExpressionValue& value) noexcept
 {
 	// Calculate payload length
-	size_t expressionLength = strlen(expression), payloadLength;
+	const size_t expressionLength = strlen(expression);
+	size_t payloadLength;
+	String<StringLength50> rslt;
 	switch (value.GetType())
 	{
 	// FIXME Add support for arrays
@@ -876,13 +1219,15 @@ bool DataTransfer::WriteEvaluationResult(const char *expression, const Expressio
 		payloadLength = expressionLength + strlen(value.sVal);
 		break;
 	case TypeCode::IPAddress:
-		payloadLength = expressionLength + 15;
-		break;
 	case TypeCode::MacAddress:
-		payloadLength = expressionLength + 17;
+	case TypeCode::DateTime:
+		// All these types are represented as strings (FIXME: should we pass a DateTime over in raw format? Can DSF handle it?)
+		value.AppendAsString(rslt.GetRef());
+		payloadLength = expressionLength + rslt.strlen();
 		break;
 	default:
-		payloadLength = expressionLength + StringLength50;
+		rslt.printf("unsupported type code %d", (int)value.type);
+		payloadLength = expressionLength + rslt.strlen();
 		break;
 	}
 
@@ -926,39 +1271,19 @@ bool DataTransfer::WriteEvaluationResult(const char *expression, const Expressio
 		header->dataType = DataType::Float;
 		header->floatValue = value.fVal;
 		break;
-	case TypeCode::IPAddress:
-	{
-		const char *ipAddress = IP4String(value.uVal).c_str();
-		header->dataType = DataType::String;
-		header->intValue = strlen(ipAddress);
-		WriteData(ipAddress, header->intValue);
-		break;
-	}
 	case TypeCode::Int32:
 		header->dataType = DataType::Int;
 		header->intValue = value.iVal;
 		break;
+	case TypeCode::DateTime:
 	case TypeCode::MacAddress:
-	{
-		String<StringLength20> macAddress;
-		macAddress.printf("\"%02x:%02x:%02x:%02x:%02x:%02x\"",
-					(unsigned int)(value.uVal & 0xFF), (unsigned int)((value.uVal >> 8) & 0xFF),
-					(unsigned int)((value.uVal >> 16) & 0xFF), (unsigned int)((value.uVal >> 24) & 0xFF),
-					(unsigned int)(value.param & 0xFF), (unsigned int)((value.param >> 8) & 0xFF));
-		header->dataType = DataType::String;
-		header->intValue = macAddress.strlen();
-		WriteData(macAddress.c_str(), macAddress.strlen());
-		break;
-	}
+	case TypeCode::IPAddress:
 	default:
-	{
-		String<StringLength50> errorMessage;
-		errorMessage.printf("unsupported type code %d", (int)value.type);
-		header->dataType = DataType::Expression;
-		header->intValue = errorMessage.strlen();
-		WriteData(errorMessage.c_str(), errorMessage.strlen());
+		// We have already converted the value to a string in 'rslt'
+		header->dataType = DataType::String;
+		header->intValue = rslt.strlen();
+		WriteData(rslt.c_str(), rslt.strlen());
 		break;
-	}
 	}
 	return true;
 }
@@ -1020,9 +1345,29 @@ bool DataTransfer::WriteWaitForAcknowledgement(GCodeChannel channel) noexcept
 	// Write header
 	CodeChannelHeader *header = WriteDataHeader<CodeChannelHeader>();
 	header->channel = channel.RawValue();
-
+	header->paddingA = 0;
+	header->paddingB = 0;
 	return true;
 }
+
+bool DataTransfer::WriteMessageAcknowledged(GCodeChannel channel) noexcept
+{
+	if (!CanWritePacket(sizeof(CodeChannelHeader)))
+	{
+		return false;
+	}
+
+	// Write packet header
+	WritePacketHeader(FirmwareRequest::MessageAcknowledged, sizeof(CodeChannelHeader));
+
+	// Write header
+	CodeChannelHeader *header = WriteDataHeader<CodeChannelHeader>();
+	header->channel = channel.RawValue();
+	header->paddingA = 0;
+	header->paddingB = 0;
+	return true;
+}
+
 
 PacketHeader *DataTransfer::WritePacketHeader(FirmwareRequest request, size_t dataLength, uint16_t resendPacketId) noexcept
 {
@@ -1030,7 +1375,7 @@ PacketHeader *DataTransfer::WritePacketHeader(FirmwareRequest request, size_t da
 	txPointer = AddPadding(txPointer);
 
 	// Write the next packet data
-	PacketHeader *header = reinterpret_cast<PacketHeader*>(txBuffer() + txPointer);
+	PacketHeader *header = reinterpret_cast<PacketHeader*>(txBuffer + txPointer);
 	header->request = static_cast<uint16_t>(request);
 	header->id = packetId++;
 	header->length = dataLength;
@@ -1042,13 +1387,13 @@ PacketHeader *DataTransfer::WritePacketHeader(FirmwareRequest request, size_t da
 void DataTransfer::WriteData(const char *data, size_t length) noexcept
 {
 	// Strings can be concatenated here, don't add any padding yet
-	memcpy(txBuffer() + txPointer, data, length);
+	memcpy(txBuffer + txPointer, data, length);
 	txPointer += length;
 }
 
 template<typename T> T *DataTransfer::WriteDataHeader() noexcept
 {
-	T *header = reinterpret_cast<T*>(txBuffer() + txPointer);
+	T *header = reinterpret_cast<T*>(txBuffer + txPointer);
 	txPointer += sizeof(T);
 	return header;
 }
