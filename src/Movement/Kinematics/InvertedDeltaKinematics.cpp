@@ -6,8 +6,12 @@
  */
 
 #include <Movement/Kinematics/InvertedDeltaKinematics.h>
+
+#include "Movement/Move.h"
 #include "RepRap.h"
+#include "Storage/FileStore.h"
 #include "GCodes/GCodeBuffer/GCodeBuffer.h"
+#include <Math/Deviation.h>
 
 
 InvertedDeltaKinematics::InvertedDeltaKinematics(): m_homed_height(300) {
@@ -93,6 +97,11 @@ void InvertedDeltaKinematics::ForwardTransform(float Ha, float Hb, float Hc, flo
 //	machinePos[X_AXIS] = -machinePos[X_AXIS];
 //	machinePos[Y_AXIS] = -machinePos[Y_AXIS];
 	machinePos[Z_AXIS] = -machinePos[Z_AXIS];
+}
+
+floatc_t InvertedDeltaKinematics::ComputeDerivative(unsigned int deriv, float ha, float hb, float hc) const noexcept
+{
+	return -LinearDeltaKinematics::ComputeDerivative( deriv, ha, hb, hc);
 }
 
 bool InvertedDeltaKinematics::CartesianToMotorSteps(const float machinePos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, int32_t motorPos[], bool isCoordinated) const noexcept
