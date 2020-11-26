@@ -152,10 +152,10 @@ void InvertedDeltaKinematics::MotorStepsToCartesian(const int32_t motorPos[], co
 
 LimitPositionResult InvertedDeltaKinematics::LimitPosition(float finalCoords[], const float * null initialCoords, size_t numVisibleAxes, AxesBitmap axesHomed, bool isCoordinated, bool applyM208Limits) const noexcept
 {
-	//finalCoords[Z_AXIS] = -finalCoords[Z_AXIS];
-	//LimitPositionResult r = LinearDeltaKinematics::LimitPosition(finalCoords, initialCoords, numVisibleAxes, axesHomed, isCoordinated, applyM208Limits);
-	//finalCoords[Z_AXIS] = -finalCoords[Z_AXIS];
-	return LimitPositionResult::ok;
+	finalCoords[Z_AXIS] = -finalCoords[Z_AXIS];
+	LimitPositionResult r = LinearDeltaKinematics::LimitPosition(finalCoords, initialCoords, numVisibleAxes, axesHomed, isCoordinated, applyM208Limits);
+	finalCoords[Z_AXIS] = -finalCoords[Z_AXIS];
+	return r;
 }
 
 InvertedDeltaKinematics::~InvertedDeltaKinematics() {
