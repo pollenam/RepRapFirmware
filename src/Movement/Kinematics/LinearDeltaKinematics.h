@@ -65,8 +65,8 @@ protected:
 	void Init() noexcept;
 	virtual void Recalc() noexcept;
 	void NormaliseEndstopAdjustments() noexcept;													// Make the average of the endstop adjustments zero
-    float Transform(const float headPos[], size_t axis) const noexcept;								// Calculate the motor position for a single tower from a Cartesian coordinate
-    void ForwardTransform(float Ha, float Hb, float Hc, float headPos[XYZ_AXES]) const noexcept;	// Calculate the Cartesian position from the motor positions
+    virtual float Transform(const float headPos[], size_t axis) const noexcept;								// Calculate the motor position for a single tower from a Cartesian coordinate
+    virtual void ForwardTransform(float Ha, float Hb, float Hc, float headPos[XYZ_AXES]) const noexcept;	// Calculate the Cartesian position from the motor positions
 
 	floatc_t ComputeDerivative(unsigned int deriv, float ha, float hb, float hc) const noexcept;	// Compute the derivative of height with respect to a parameter at a set of motor endpoints
 	void Adjust(size_t numFactors, const floatc_t v[]) noexcept;									// Perform 3-, 4-, 6- or 7-factor adjustment

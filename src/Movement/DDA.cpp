@@ -298,6 +298,10 @@ bool DDA::InitStandardMove(DDARing& ring, const RawMove &nextMove, bool doMotorM
 				delta = endPoint[drive] - positionNow[drive];
 				const float positionDelta = endCoordinates[drive] - prev->GetEndCoordinate(drive, false);
 				directionVector[drive] = positionDelta;
+				if(drive == Z_AXIS) // Délires Benjamin
+				{
+					directionVector[drive] = -directionVector[drive]; // invert direction for delta motion
+				}
 				if (positionDelta != 0.0 && (Tool::GetXAxes(nextMove.tool).IsBitSet(drive) || Tool::GetYAxes(nextMove.tool).IsBitSet(drive)))
 				{
 					flags.xyMoving = true;				// this move has XY movement in user space, before axis were mapped

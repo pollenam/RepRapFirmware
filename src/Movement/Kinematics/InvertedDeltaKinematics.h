@@ -23,9 +23,11 @@ public:
 
 protected:
 	virtual void Recalc() noexcept;
+    virtual float Transform(const float headPos[], size_t axis) const noexcept override;								// Calculate the motor position for a single tower from a Cartesian coordinate
+    virtual void ForwardTransform(float Ha, float Hb, float Hc, float machinePos[XYZ_AXES]) const noexcept override;
 
 private:
-	float maxPrintingHeight; // absolute height below homing position
+	float m_homed_height; // height above carriage when homed.
 
 };
 

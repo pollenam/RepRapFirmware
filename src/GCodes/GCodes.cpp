@@ -1856,7 +1856,7 @@ bool GCodes::DoStraightMove(GCodeBuffer& gb, bool isCoordinated, const char *& e
 			}
 
 			axesMentioned.SetBit(axis);
-			float moveArg = gb.GetDistance();
+			const float moveArg = gb.GetDistance();
 
 			if (moveBuffer.moveType != 0)
 			{
@@ -1879,10 +1879,6 @@ bool GCodes::DoStraightMove(GCodeBuffer& gb, bool isCoordinated, const char *& e
 			}
 			else if (gb.MachineState().axesRelative)
 			{
-				if(axis == Z_AXIS)
-				{
-					moveArg = -moveArg;
-				}
 				currentUserPosition[axis] += moveArg * (1.0 - moveFractionToSkip);
 			}
 			else if (gb.MachineState().g53Active)
@@ -1895,10 +1891,6 @@ bool GCodes::DoStraightMove(GCodeBuffer& gb, bool isCoordinated, const char *& e
 			}
 			else
 			{
-				if(axis == Z_AXIS)
-				{
-					moveArg = -moveArg;
-				}
 				currentUserPosition[axis] = moveArg + GetWorkplaceOffset(axis);
 			}
 		}

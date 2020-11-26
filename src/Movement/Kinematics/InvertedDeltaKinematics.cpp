@@ -10,7 +10,7 @@
 #include "GCodes/GCodeBuffer/GCodeBuffer.h"
 
 
-InvertedDeltaKinematics::InvertedDeltaKinematics(): maxPrintingHeight(300) {
+InvertedDeltaKinematics::InvertedDeltaKinematics(): m_homed_height(300) {
 	// TODO Auto-generated constructor stub
 }
 
@@ -26,15 +26,13 @@ void InvertedDeltaKinematics::Recalc() noexcept
 
 	// Calculate the squares of the diagonals and the base carriage heights when the printer is homed, i.e. the carriages are at the endstops
 	// Also calculate the always-reachable height
-	alwaysReachableHeight = maxPrintingHeight;
-	for (size_t axis = 0; axis < numTowers; ++axis)
-	{
-		homedCarriageHeights[axis] = -homedHeight
-									+ sqrtf(D2[axis] - ((axis < UsualNumTowers) ? fsquare(radius) : fsquare(towerX[axis]) + fsquare(towerY[axis])))
-									+ endstopAdjustments[axis];
-	}
+//	alwaysReachableHeight = maxPrintingHeight;
+//	for (size_t axis = 0; axis < numTowers; ++axis)
+//	{
+//		homedCarriageHeights[axis] = m_homed_height + endstopAdjustments[axis];
+//	}
 
-	printRadiusSquared = fsquare(printRadius);
+//	printRadiusSquared = fsquare(printRadius);
 
 	if (reprap.Debug(moduleMove))
 	{
@@ -55,7 +53,7 @@ bool InvertedDeltaKinematics::Configure(unsigned int mCode, GCodeBuffer& gb, con
 	{
 		if (gb.Seen('J'))
 		{
-			maxPrintingHeight = gb.GetFValue();
+			m_homed_height = gb.GetFValue();
 		}
 	}
 	break;
@@ -65,48 +63,90 @@ bool InvertedDeltaKinematics::Configure(unsigned int mCode, GCodeBuffer& gb, con
 	return LinearDeltaKinematics::Configure(mCode, gb, reply, error);
 }
 
+float InvertedDeltaKinematics::Transform(const float headPos[], size_t axis) const noexcept
+{
+	//debugPrintf("axis: %d, value: %f\n", axis, headPos[axis]);
+	//homedCarriageHeights[axis]
+	if (axis < numTowers)
+	{
+		return sqrtf(D2[axis] - fsquare(headPos[X_AXIS] - towerX[axis]) - fsquare(headPos[Y_AXIS] - towerY[axis]))
+			 - headPos[Z_AXIS]
+			 + (headPos[X_AXIS] * xTilt)
+			 + (headPos[Y_AXIS] * yTilt);
+	}
+	else
+	{
+		return headPos[axis];
+	}
+}
+
+// Calculate the Cartesian coordinates from the motor coordinates
+void InvertedDeltaKinematics::ForwardTransform(float Ha, float Hb, float Hc, float machinePos[XYZ_AXES]) const noexcept
+{
+	//debugPrintf("Forward transform !!!\n");
+	// Convert Ha, Hb, Hc from our Coordinate system to standard one.
+	//Ha = homedCarriageHeights[DELTA_A_AXIS] - Ha;
+	//Hb = homedCarriageHeights[DELTA_B_AXIS] - Hb;
+	//Hc = homedCarriageHeights[DELTA_C_AXIS] - Hc;
+
+	LinearDeltaKinematics::ForwardTransform(Ha, Hb, Hc, machinePos);
+//	machinePos[X_AXIS] = -machinePos[X_AXIS];
+//	machinePos[Y_AXIS] = -machinePos[Y_AXIS];
+	machinePos[Z_AXIS] = -machinePos[Z_AXIS];
+}
+
 bool InvertedDeltaKinematics::CartesianToMotorSteps(const float machinePos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, int32_t motorPos[], bool isCoordinated) const noexcept
 {
-	// float invertedMachinePos[MaxAxes];
-	// for (size_t axis = 0; axis < numVisibleAxes; ++axis)
-	// {
-	// 	invertedMachinePos[axis] = machinePos[axis];
-	// }
-	// invertedMachinePos[Z_AXIS] = -machinePos[Z_AXIS];
-	bool r = LinearDeltaKinematics::CartesianToMotorSteps(machinePos, stepsPerMm, numVisibleAxes, numTotalAxes, motorPos, isCoordinated);
-//	if (reprap.Debug(moduleMove))
-//	{
-//		debugPrintf("CartesianToMotorSteps :");
-//		for (size_t i = 0; i < numVisibleAxes; ++i)
-//		{
-//			debugPrintf(" %.2f / %d", invertedMachinePos[i], motorPos[i]);
-//		}
-//		debugPrintf("\n");
-//	}
-	return r;
+	//debugPrintf("CartesianToMotorSteps !!!\n");
+	bool ok = true;
+		for (size_t axis = 0; axis < numTowers; ++axis)
+		{
+			const float pos = Transform(machinePos, axis);
+			if (std::isnan(pos) || std::isinf(pos))
+			{
+				ok = false;
+			}
+			else
+			{
+				motorPos[axis] = lrintf(pos * stepsPerMm[axis]);
+			}
+		}
+
+		// Transform any additional axes linearly
+		for (size_t axis = numTowers; axis < numVisibleAxes; ++axis)
+		{
+			motorPos[axis] = lrintf(machinePos[axis] * stepsPerMm[axis]);
+		}
+
+		if (reprap.Debug(moduleMove))
+		{
+			debugPrintf("CartesianToMotorSteps LinearDelta) :");
+			for (size_t i = 0; i < numVisibleAxes; ++i)
+			{
+				debugPrintf(" %.2f / %d / %.2f", machinePos[i], motorPos[i], motorPos[i]/stepsPerMm[i]);
+			}
+			debugPrintf("\n");
+		}
+		return ok;
 }
 
 void InvertedDeltaKinematics::MotorStepsToCartesian(const int32_t motorPos[], const float stepsPerMm[], size_t numVisibleAxes, size_t numTotalAxes, float machinePos[]) const noexcept
 {
-	return LinearDeltaKinematics::MotorStepsToCartesian(motorPos, stepsPerMm, numVisibleAxes, numTotalAxes, machinePos);
-	// machinePos[Z_AXIS] = -machinePos[Z_AXIS];
-	// if (reprap.Debug(moduleMove))
-	// {
-	// 	debugPrintf("MotorStepsToCartesian :");
-	// 	for (size_t i = 0; i < numVisibleAxes; ++i)
-	// 	{
-	// 		debugPrintf(" %.2f / %d", machinePos[i], motorPos[i]);
-	// 	}
-	// 	debugPrintf("\n");
-	// }
+	ForwardTransform(motorPos[DELTA_A_AXIS]/stepsPerMm[DELTA_A_AXIS], motorPos[DELTA_B_AXIS]/stepsPerMm[DELTA_B_AXIS], motorPos[DELTA_C_AXIS]/stepsPerMm[DELTA_C_AXIS], machinePos);
+
+	// Convert any additional axes linearly
+	for (size_t drive = numTowers; drive < numVisibleAxes; ++drive)
+	{
+		machinePos[drive] = motorPos[drive]/stepsPerMm[drive];
+	}
 }
 
 LimitPositionResult InvertedDeltaKinematics::LimitPosition(float finalCoords[], const float * null initialCoords, size_t numVisibleAxes, AxesBitmap axesHomed, bool isCoordinated, bool applyM208Limits) const noexcept
 {
-	finalCoords[Z_AXIS] = -finalCoords[Z_AXIS];
-	LimitPositionResult r = LinearDeltaKinematics::LimitPosition(finalCoords, initialCoords, numVisibleAxes, axesHomed, isCoordinated, applyM208Limits);
-	finalCoords[Z_AXIS] = -finalCoords[Z_AXIS];
-	return r;
+	//finalCoords[Z_AXIS] = -finalCoords[Z_AXIS];
+	//LimitPositionResult r = LinearDeltaKinematics::LimitPosition(finalCoords, initialCoords, numVisibleAxes, axesHomed, isCoordinated, applyM208Limits);
+	//finalCoords[Z_AXIS] = -finalCoords[Z_AXIS];
+	return LimitPositionResult::ok;
 }
 
 InvertedDeltaKinematics::~InvertedDeltaKinematics() {
