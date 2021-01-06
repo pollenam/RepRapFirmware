@@ -70,12 +70,11 @@ bool InvertedDeltaKinematics::Configure(unsigned int mCode, GCodeBuffer& gb, con
 float InvertedDeltaKinematics::Transform(const float headPos[], size_t axis) const noexcept
 {
 	//debugPrintf("axis: %d, value: %f\n", axis, headPos[axis]);
-	//homedCarriageHeights[axis]
 	if (axis < numTowers)
 	{
-		return sqrtf(D2[axis] - fsquare(headPos[X_AXIS] - towerX[axis]) - fsquare(headPos[Y_AXIS] - towerY[axis]))
+		return sqrtf(D2[axis] - fsquare(-headPos[X_AXIS] - towerX[axis]) - fsquare(headPos[Y_AXIS] - towerY[axis]))
 			 - headPos[Z_AXIS]
-			 + (headPos[X_AXIS] * xTilt)
+			 + (-headPos[X_AXIS] * xTilt)
 			 + (headPos[Y_AXIS] * yTilt);
 	}
 	else
@@ -87,15 +86,9 @@ float InvertedDeltaKinematics::Transform(const float headPos[], size_t axis) con
 // Calculate the Cartesian coordinates from the motor coordinates
 void InvertedDeltaKinematics::ForwardTransform(float Ha, float Hb, float Hc, float machinePos[XYZ_AXES]) const noexcept
 {
-	//debugPrintf("Forward transform !!!\n");
-	// Convert Ha, Hb, Hc from our Coordinate system to standard one.
-	//Ha = homedCarriageHeights[DELTA_A_AXIS] - Ha;
-	//Hb = homedCarriageHeights[DELTA_B_AXIS] - Hb;
-	//Hc = homedCarriageHeights[DELTA_C_AXIS] - Hc;
-
 	LinearDeltaKinematics::ForwardTransform(Ha, Hb, Hc, machinePos);
-//	machinePos[X_AXIS] = -machinePos[X_AXIS];
-//	machinePos[Y_AXIS] = -machinePos[Y_AXIS];
+	machinePos[X_AXIS] = -machinePos[X_AXIS];
+//	machinePos[Y_AXIS] = machinePos[Y_AXIS];
 	machinePos[Z_AXIS] = -machinePos[Z_AXIS];
 }
 

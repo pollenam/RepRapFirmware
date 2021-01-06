@@ -298,7 +298,7 @@ bool DDA::InitStandardMove(DDARing& ring, const RawMove &nextMove, bool doMotorM
 				delta = endPoint[drive] - positionNow[drive];
 				const float positionDelta = endCoordinates[drive] - prev->GetEndCoordinate(drive, false);
 				directionVector[drive] = positionDelta;
-				if(drive == Z_AXIS) // Délires Benjamin
+				if (drive == Z_AXIS || drive == X_AXIS )// || drive == Y_AXIS ) // Délires Benjamin
 				{
 					directionVector[drive] = -directionVector[drive]; // invert direction for delta motion
 				}
@@ -1223,7 +1223,7 @@ void DDA::Prepare(uint8_t simMode, float extrusionPending[]) noexcept
 			// Ideally we would store the initial X and Y coordinates in the DDA, but we need to be economical with memory in the Duet 06/085 build.
 			afterPrepare.cKc = roundS32(directionVector[Z_AXIS] * DriveMovement::Kc);
 			params.a2plusb2 = fsquare(directionVector[X_AXIS]) + fsquare(directionVector[Y_AXIS]);
-			params.initialX = prev->GetEndCoordinate(X_AXIS, false);
+			params.initialX = -prev->GetEndCoordinate(X_AXIS, false); // Délire Benjamin 2
 			params.initialY = prev->GetEndCoordinate(Y_AXIS, false);
 #if SUPPORT_CAN_EXPANSION
 			params.finalX = GetEndCoordinate(X_AXIS, false);
