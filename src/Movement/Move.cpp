@@ -139,12 +139,13 @@ constexpr ObjectModelTableEntry Move::objectModelTable[] =
 	{ "mean",					OBJECT_MODEL_FUNC(self->latestMeshDeviation.GetMean(), 3),								ObjectModelEntryFlags::none },
 
 	// 9. move.compensation.skew members
+	{ "compensateXY",			OBJECT_MODEL_FUNC(self->compensateXY),													ObjectModelEntryFlags::none },
 	{ "tanXY",					OBJECT_MODEL_FUNC(self->tanXY, 4),														ObjectModelEntryFlags::none },
 	{ "tanXZ",					OBJECT_MODEL_FUNC(self->tanXZ, 4),														ObjectModelEntryFlags::none },
 	{ "tanYZ",					OBJECT_MODEL_FUNC(self->tanYZ, 4),														ObjectModelEntryFlags::none },
 };
 
-constexpr uint8_t Move::objectModelTableDescriptor[] = { 10, 14, 3, 2, 4 + SUPPORT_LASER, 3, 2, 2, 5 + (HAS_MASS_STORAGE || HAS_LINUX_INTERFACE), 2, 3 };
+constexpr uint8_t Move::objectModelTableDescriptor[] = { 10, 14, 3, 2, 4 + SUPPORT_LASER, 3, 2, 2, 5 + (HAS_MASS_STORAGE || HAS_LINUX_INTERFACE), 2, 4 };
 
 DEFINE_GET_OBJECT_MODEL_TABLE(Move)
 
@@ -165,11 +166,11 @@ Move::Move() noexcept
 {
 	// Kinematics must be set up here because GCodes::Init asks the kinematics for the assumed initial position
 	kinematics = Kinematics::Create(KinematicsType::cartesian);		// default to Cartesian
-	mainDDARing.Init1(DdaRingLength);
+	mainDDARing.Init1(InitialDdaRingLength);
 #if SUPPORT_ASYNC_MOVES
 	auxDDARing.Init1(AuxDdaRingLength);
 #endif
-	DriveMovement::InitialAllocate(NumDms);
+	DriveMovement::InitialAllocate(InitialNumDms);
 }
 
 void Move::Init() noexcept
@@ -184,6 +185,7 @@ void Move::Init() noexcept
 
 	// Clear the transforms
 	SetIdentityTransform();
+	compensateXY = true;
 	tanXY = tanYZ = tanXZ = 0.0;
 
 	usingMesh = useTaper = false;
@@ -205,6 +207,9 @@ void Move::Exit() noexcept
 {
 	StepTimer::DisableTimerInterrupt();
 	mainDDARing.Exit();
+#if SUPPORT_ASYNC_MOVES
+	auxDDARing.Exit();
+#endif
 #if SUPPORT_LASER || SUPPORT_IOBITS
 	delete laserTask;
 	laserTask = nullptr;
@@ -417,26 +422,7 @@ bool Move::LowPowerOrStallPause(RestorePoint& rp) noexcept
 
 void Move::Diagnostics(MessageType mtype) noexcept
 {
-	Platform& p = reprap.GetPlatform();
-	p.MessageF(mtype, "=== Move ===\nHiccups: %" PRIu32
-#if SUPPORT_ASYNC_MOVES
-						"(%" PRIu32 ")"
-#endif
-						", FreeDm: %d, MinFreeDm: %d, MaxWait: %" PRIu32 "ms\n",
-						mainDDARing.GetClearNumHiccups(),
-#if SUPPORT_ASYNC_MOVES
-						auxDDARing.GetClearNumHiccups(),
-#endif
-						DriveMovement::NumFree(), DriveMovement::MinFree(), longestGcodeWaitInterval);
-	longestGcodeWaitInterval = 0;
-	DriveMovement::ResetMinFree();
-
-#if defined(__ALLIGATOR__)
-	// Motor Fault Diagnostic
-	reprap.GetPlatform().MessageF(mtype, "Motor Fault status: %s\n", digitalRead(MotorFaultDetectPin) ? "none" : "FAULT detected!" );
-#endif
-
-	// Show the current probe position heights and type of bed compensation in use
+	// Get the type of bed compensation in use
 	String<StringLength50> bedCompString;
 	if (usingMesh)
 	{
@@ -450,19 +436,11 @@ void Move::Diagnostics(MessageType mtype) noexcept
 	{
 		bedCompString.copy("none");
 	}
-	p.MessageF(mtype, "Bed compensation in use: %s, comp offset %.3f\n", bedCompString.c_str(), (double)zShift);
 
-	// Only print the probe point heights if we are using old-style compensation
-	if (!usingMesh && probePoints.GetNumBedCompensationPoints() != 0)
-	{
-		// To keep the response short so that it doesn't get truncated when sending it via HTTP, we only show the first 5 bed probe points
-		bedCompString.Clear();
-		for (size_t i = 0; i < 5; ++i)
-		{
-			bedCompString.catf(" %.3f", (double)probePoints.GetZHeight(i));
-		}
-		p.MessageF(mtype, "Bed probe heights:%s\n", bedCompString.c_str());
-	}
+	Platform& p = reprap.GetPlatform();
+	p.MessageF(mtype, "=== Move ===\nDMs created %u, maxWait %" PRIu32 "ms, bed compensation in use: %s, comp offset %.3f\n",
+						DriveMovement::NumCreated(), longestGcodeWaitInterval, bedCompString.c_str(), (double)zShift);
+	longestGcodeWaitInterval = 0;
 
 #if DDA_LOG_PROBE_CHANGES
 	// Temporary code to print Z probe trigger positions
@@ -588,15 +566,16 @@ void Move::AxisTransform(float xyzPoint[MaxAxes], const Tool *tool) const noexce
 	{
 		// Found a Y axis. Use this one when correcting the X coordinate.
 		const AxesBitmap xAxes = Tool::GetXAxes(tool);
+		const size_t lowestXAxis = xAxes.LowestSetBit();
 		for (size_t axis = 0; axis < numVisibleAxes; ++axis)
 		{
 			if (xAxes.IsBitSet(axis))
 			{
-				xyzPoint[axis] += tanXY*xyzPoint[lowestYAxis] + tanXZ*xyzPoint[Z_AXIS];
+				xyzPoint[axis] += (compensateXY ? tanXY*xyzPoint[lowestYAxis] : 0.0) + tanXZ*xyzPoint[Z_AXIS];
 			}
 			if (yAxes.IsBitSet(axis))
 			{
-				xyzPoint[axis] += tanYZ*xyzPoint[Z_AXIS];
+				xyzPoint[axis] += (compensateXY ? 0.0 : tanXY*xyzPoint[lowestXAxis]) + tanYZ*xyzPoint[Z_AXIS];
 			}
 		}
 	}
@@ -619,15 +598,16 @@ void Move::InverseAxisTransform(float xyzPoint[MaxAxes], const Tool *tool) const
 	{
 		// Found a Y axis. Use this one when correcting the X coordinate.
 		const AxesBitmap xAxes = Tool::GetXAxes(tool);
+		const size_t lowestXAxis = xAxes.LowestSetBit();
 		for (size_t axis = 0; axis < numVisibleAxes; ++axis)
 		{
 			if (yAxes.IsBitSet(axis))
 			{
-				xyzPoint[axis] -= tanYZ*xyzPoint[Z_AXIS];
+				xyzPoint[axis] -= ((compensateXY ? 0.0 : tanXY*xyzPoint[lowestXAxis]) + tanYZ*xyzPoint[Z_AXIS]);
 			}
 			if (xAxes.IsBitSet(axis))
 			{
-				xyzPoint[axis] -= (tanXY*xyzPoint[lowestYAxis] + tanXZ*xyzPoint[Z_AXIS]);
+				xyzPoint[axis] -= ((compensateXY ? tanXY*xyzPoint[lowestYAxis] : 0.0) + tanXZ*xyzPoint[Z_AXIS]);
 			}
 		}
 	}
@@ -636,7 +616,8 @@ void Move::InverseAxisTransform(float xyzPoint[MaxAxes], const Tool *tool) const
 // Do the bed transform AFTER the axis transform
 void Move::BedTransform(float xyzPoint[MaxAxes], const Tool *tool) const noexcept
 {
-	if (!useTaper || xyzPoint[Z_AXIS] < taperHeight)
+	const float toolHeight = xyzPoint[Z_AXIS] + Tool::GetOffset(tool, Z_AXIS);
+	if (!useTaper || toolHeight < taperHeight)
 	{
 		float zCorrection = 0.0;
 		const size_t numAxes = reprap.GetGCodes().GetVisibleAxes();
@@ -645,6 +626,7 @@ void Move::BedTransform(float xyzPoint[MaxAxes], const Tool *tool) const noexcep
 		unsigned int numCorrections = 0;
 
 		// Transform the Z coordinate based on the average correction for each axis used as an X or Y axis.
+		// TODO use Iterate when we have changed it to use inline_function
 		for (uint32_t xAxis = 0; xAxis < numAxes; ++xAxis)
 		{
 			if (xAxes.IsBitSet(xAxis))
@@ -668,7 +650,7 @@ void Move::BedTransform(float xyzPoint[MaxAxes], const Tool *tool) const noexcep
 		}
 
 		zCorrection += zShift;
-		xyzPoint[Z_AXIS] += (useTaper) ? (taperHeight - xyzPoint[Z_AXIS]) * recipTaperHeight * zCorrection : zCorrection;
+		xyzPoint[Z_AXIS] += (useTaper && zCorrection < taperHeight) ? (taperHeight - toolHeight) * recipTaperHeight * zCorrection : zCorrection;
 	}
 }
 
@@ -712,8 +694,9 @@ void Move::InverseBedTransform(float xyzPoint[MaxAxes], const Tool *tool) const 
 	}
 	else
 	{
-		const float zreq = (xyzPoint[Z_AXIS] - zCorrection)/(1.0 - (zCorrection * recipTaperHeight));
-		if (zreq < taperHeight)
+		const float toolZoffset = Tool::GetOffset(tool, Z_AXIS);
+		const float zreq = (xyzPoint[Z_AXIS] - (taperHeight - toolZoffset) * zCorrection * recipTaperHeight)/(1.0 - zCorrection * recipTaperHeight);
+		if (zreq + toolZoffset < taperHeight)
 		{
 			xyzPoint[Z_AXIS] = zreq;
 		}
@@ -804,7 +787,19 @@ void Move::SetAxisCompensation(unsigned int axis, float tangent) noexcept
 	if (axis < ARRAY_SIZE(tangents))
 	{
 		tangents[axis] = tangent;
+		reprap.MoveUpdated();
 	}
+}
+
+bool Move::IsXYCompensated() const
+{
+	return compensateXY;
+}
+
+void Move::SetXYCompensation(bool xyCompensation)
+{
+	compensateXY = xyCompensation;
+	reprap.MoveUpdated();
 }
 
 // Calibrate or set the bed equation after probing, returning true if an error occurred
@@ -1047,6 +1042,12 @@ GCodeResult Move::ConfigureDynamicAcceleration(GCodeBuffer& gb, const StringRef&
 		}
 	}
 	return GCodeResult::ok;
+}
+
+// Process M595
+GCodeResult Move::ConfigureMovementQueue(GCodeBuffer& gb, const StringRef& reply) noexcept
+{
+	return mainDDARing.ConfigureMovementQueue(gb, reply);
 }
 
 // Return the current live XYZ and extruder coordinates

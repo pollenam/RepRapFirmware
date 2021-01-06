@@ -39,6 +39,7 @@ Licence: GPL
 #include <GPIO/GpInPort.h>
 #include <GPIO/GpOutPort.h>
 #include <Comms/AuxDevice.h>
+#include <Comms/PanelDueUpdater.h>
 #include <General/IPAddress.h>
 
 #if defined(DUET_NG)
@@ -183,6 +184,7 @@ enum class DiagnosticTestType : unsigned int
 	TimeSDWrite = 104,				// do a write timing test on the SD card
 	PrintObjectSizes = 105,			// print the sizes of various objects
 	PrintObjectAddresses = 106,		// print the addresses and sizes of various objects
+	TimeCRC32 = 107,				// time how long it takes to calculate CRC32
 
 #ifdef __LPC17xx__
 	PrintBoardConfiguration = 200,	// Prints out all pin/values loaded from SDCard to configure board
@@ -356,7 +358,7 @@ public:
 	const MacAddress& GetDefaultMacAddress() const noexcept { return defaultMacAddress; }
 
 	// Timing
-	void Tick() noexcept __attribute__((hot));						// Process a systick interrupt
+	void Tick() noexcept SPEED_CRITICAL;			// Process a systick interrupt
 
 	// Real-time clock
 	bool IsDateTimeSet() const noexcept { return realTime != 0; }	// Has the RTC been set yet?
@@ -375,6 +377,10 @@ public:
     void EnableAux(size_t auxNumber) noexcept;
     bool IsAuxRaw(size_t auxNumber) const noexcept;
 	void SetAuxRaw(size_t auxNumber, bool raw) noexcept;
+#if HAS_AUX_DEVICES
+	PanelDueUpdater* GetPanelDueUpdater() noexcept { return panelDueUpdater; }
+	void InitPanelDueUpdater() noexcept;
+#endif
 
 	void SetIPAddress(IPAddress ip) noexcept;
 	IPAddress GetIPAddress() const noexcept;
@@ -393,10 +399,12 @@ public:
 #endif
 
 	// File functions
-#if HAS_MASS_STORAGE
+#if HAS_MASS_STORAGE || HAS_LINUX_INTERFACE
 	FileStore* OpenFile(const char* folder, const char* fileName, OpenMode mode, uint32_t preAllocSize = 0) const noexcept;
-	bool Delete(const char* folder, const char *filename) const noexcept;
 	bool FileExists(const char* folder, const char *filename) const noexcept;
+#endif
+#if HAS_MASS_STORAGE
+	bool Delete(const char* folder, const char *filename) const noexcept;
 	bool DirectoryExists(const char *folder, const char *dir) const noexcept;
 
 	const char* GetWebDir() const noexcept; 					// Where the html etc files are
@@ -410,7 +418,7 @@ public:
 	bool DeleteSysFile(const char *filename) const noexcept;
 	bool MakeSysFileName(const StringRef& result, const char *filename) const noexcept;
 	void AppendSysDir(const StringRef & path) const noexcept;
-	void EncodeSysDir(OutputBuffer *buf) const noexcept;
+	ReadLockedPointer<const char> GetSysDir() const noexcept;	// where the system files are
 #endif
 
 	// Message output (see MessageType for further details)
@@ -418,7 +426,8 @@ public:
 	void Message(MessageType type, OutputBuffer *buffer) noexcept;
 	void MessageF(MessageType type, const char *fmt, ...) noexcept __attribute__ ((format (printf, 3, 4)));
 	void MessageF(MessageType type, const char *fmt, va_list vargs) noexcept;
-	bool FlushMessages() noexcept;							// Flush messages to USB and aux, returning true if there is more to send
+	void DebugMessage(const char *fmt, va_list vargs) noexcept;
+	bool FlushMessages() noexcept;								// Flush messages to USB and aux, returning true if there is more to send
 	void SendAlert(MessageType mt, const char *message, const char *title, int sParam, float tParam, AxesBitmap controls) noexcept;
 	void StopLogging() noexcept;
 
@@ -581,11 +590,11 @@ public:
 	GCodeResult ConfigureStallDetection(GCodeBuffer& gb, const StringRef& reply, OutputBuffer *& buf) THROWS(GCodeException);
 #endif
 
-#if HAS_MASS_STORAGE
 	// Logging support
+	const char *GetLogLevel() const noexcept;
+#if HAS_MASS_STORAGE
 	GCodeResult ConfigureLogging(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException);
 	const char *GetLogFileName() const noexcept;
-	const char *GetLogLevel() const noexcept;
 #endif
 
 	// Ancillary PWM
@@ -807,46 +816,16 @@ private:
 
 #if HAS_AUX_DEVICES
 	AuxDevice auxDevices[NumSerialChannels - 1];
+	PanelDueUpdater* panelDueUpdater;
 #endif
 
 	// Files
 #if HAS_MASS_STORAGE
 	const char *sysDir;
+	mutable ReadWriteLock sysDirLock;
 #endif
 
 	// Data used by the tick interrupt handler
-
-	// Heater #n, 0 <= n < HEATERS, uses "temperature channel" tc given by
-	//
-	//     tc = heaterTempChannels[n]
-	//
-	// Temperature channels follow a convention of
-	//
-	//     if (0 <= tc < HEATERS) then
-	//        The temperature channel is a thermistor read using ADC.
-	//        The actual ADC to read for tc is
-	//
-	//            thermistorAdcChannel[tc]
-	//
-	//        which, is equivalent to
-	//
-	//            PinToAdcChannel(tempSensePins[tc])
-	//
-	//     if (100 <= tc < 100 + (MaxSpiTempSensors - 1)) then
-	//        The temperature channel is a thermocouple attached to a MAX31855 chip
-	//        The MAX31855 object corresponding to the specific MAX31855 chip is
-	//
-	//            Max31855Devices[tc - 100]
-	//
-	//       Note that the MAX31855 objects, although statically declared, are not
-	//       initialized until configured via a "M305 Pn X10m" command with 0 <= n < HEATERS
-	//       and 0 <= m < MaxSpiTempSensors.
-	//
-	// NOTE BENE: When a M305 command is processed, the onus is on the gcode processor,
-	// GCodes.cpp, to range check the value of the X parameter.  Code consuming the results
-	// of the M305 command (e.g., SetThermistorNumber() and array lookups assume range
-	// checking has already been performed.
-
 	AnalogChannelNumber filteredAdcChannels[NumAdcFilters];
 	AnalogChannelNumber zProbeAdcChannel;
 	uint8_t tickState;

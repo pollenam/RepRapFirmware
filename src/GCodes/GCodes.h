@@ -136,6 +136,7 @@ public:
 		pre(axis < maxAxes);
 	float GetUserCoordinate(size_t axis) const noexcept;						// Get the current user coordinate in the current workspace coordinate system
 
+	bool CheckNetworkCommandAllowed(GCodeBuffer& gb, const StringRef& reply, GCodeResult& result) noexcept;
 #if HAS_NETWORKING
 	NetworkGCodeInput *GetHTTPInput() const noexcept { return httpInput; }
 	NetworkGCodeInput *GetTelnetInput() const noexcept { return telnetInput; }
@@ -143,6 +144,7 @@ public:
 
 	PauseState GetPauseState() const noexcept { return pauseState; }
 	bool IsFlashing() const noexcept { return isFlashing; }						// Is a new firmware binary going to be flashed?
+	bool IsFlashingPanelDue() const noexcept { return isFlashingPanelDue; }
 
 	bool IsReallyPrinting() const noexcept;										// Return true if we are printing from SD card and not pausing, paused or resuming
 	bool IsReallyPrintingOrResuming() const noexcept;
@@ -332,7 +334,7 @@ private:
 	void HandleReply(GCodeBuffer& gb, OutputBuffer *reply) noexcept;
 	void HandleReplyPreserveResult(GCodeBuffer& gb, GCodeResult rslt, const char *reply) noexcept;	// Handle G-Code replies
 
-	bool DoStraightMove(GCodeBuffer& gb, bool isCoordinated, const char *& err) __attribute__((hot));	// Execute a straight move
+	bool DoStraightMove(GCodeBuffer& gb, bool isCoordinated, const char *& err) SPEED_CRITICAL;	// Execute a straight move
 	bool DoArcMove(GCodeBuffer& gb, bool clockwise, const char *& err)				// Execute an arc move
 		pre(segmentsLeft == 0; resourceOwners[MoveResource] == &gb);
 	void FinaliseMove(GCodeBuffer& gb) noexcept;									// Adjust the move parameters to account for segmentation and/or part of the move having been done already
@@ -462,9 +464,15 @@ private:
 #endif
 	Pwm_t ConvertLaserPwm(float reqVal) const noexcept;
 
-	bool CheckNetworkCommandAllowed(GCodeBuffer& gb, const StringRef& reply, GCodeResult& result) noexcept;
-
 #if HAS_AUX_DEVICES
+#if !ALLOW_ARBITRARY_PANELDUE_PORT
+	static constexpr
+#endif
+	uint8_t serialChannelForPanelDueFlashing
+#if !ALLOW_ARBITRARY_PANELDUE_PORT
+	= 1
+#endif
+	;
 	static bool emergencyStopCommanded;
 	static void CommandEmergencyStop(UARTClass *p) noexcept;
 #endif
@@ -623,6 +631,7 @@ private:
 	// Firmware update
 	uint8_t firmwareUpdateModuleMap;			// Bitmap of firmware modules to be updated
 	bool isFlashing;							// Is a new firmware binary going to be flashed?
+	bool isFlashingPanelDue;					// Are we in the process of flashing PanelDue?
 
 	// Code queue
 	GCodeQueue *codeQueue;						// Stores certain codes for deferred execution

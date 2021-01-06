@@ -118,7 +118,7 @@ private:
 	void ExchangeResponse(uint32_t response) noexcept;
 	void ExchangeData() noexcept;
 	void ResetTransfer(bool ownRequest) noexcept;
-	uint16_t CRC16(const char *buffer, size_t length) const noexcept;
+	uint32_t CalcCRC32(const char *buffer, size_t length) const noexcept;
 
 	template<typename T> const T *ReadDataHeader() noexcept;
 
@@ -141,7 +141,8 @@ inline bool DataTransfer::IsConnected() const noexcept
 
 inline bool DataTransfer::LinuxHadReset() const noexcept
 {
-	return lastTransferNumber + 1 != rxHeader.sequenceNumber;
+	uint16_t nextTransferNumber = lastTransferNumber + 1;
+	return lastTransferNumber != 0 && (nextTransferNumber != rxHeader.sequenceNumber);
 }
 
 inline size_t DataTransfer::PacketsToRead() const noexcept
@@ -161,8 +162,8 @@ inline bool DataTransfer::CanWritePacket(size_t dataLength) const noexcept
 
 inline size_t DataTransfer::AddPadding(size_t length) const noexcept
 {
-	size_t padding = 4 - length % 4;
-	return length + ((padding == 4) ? 0 : padding);
+	size_t extraBytes = (length & 3);
+	return (extraBytes == 0) ? length : length + 4 - extraBytes;
 }
 
 #endif	// HAS_LINUX_INTERFACE

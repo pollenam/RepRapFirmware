@@ -212,7 +212,7 @@ void DDA::DebugPrintVector(const char *name, const float *vec, size_t len) const
 void DDA::DebugPrint(const char *tag) const noexcept
 {
 	const size_t numAxes = reprap.GetGCodes().GetTotalAxes();
-	debugPrintf("%s %u ts=%" PRIu32 "DDA:", tag, (unsigned int)state, afterPrepare.moveStartTime);
+	debugPrintf("%s %u ts=%" PRIu32 " DDA:", tag, (unsigned int)state, afterPrepare.moveStartTime);
 	if (flags.endCoordinatesValid)
 	{
 		float startCoordinates[MaxAxes];
@@ -783,10 +783,12 @@ pre(state == provisional)
 			// Still going up
 			laDDA = laDDA->prev;
 			++laDepth;
+#if 0
 			if (reprap.Debug(moduleDda))
 			{
 				debugPrintf("Recursion start %u\n", laDepth);
 			}
+#endif
 		}
 		else
 		{
@@ -815,7 +817,12 @@ LA_DEBUG;
 
 			if (laDepth == 0)
 			{
-//				if (reprap.Debug(moduleDda)) debugPrintf("Complete, %f\n", laDDA->targetNextSpeed);
+#if 0
+				if (reprap.Debug(moduleDda))
+				{
+					debugPrintf("Complete, %f\n", laDDA->targetNextSpeed);
+				}
+#endif
 				return;
 			}
 
@@ -1785,9 +1792,6 @@ void DDA::CheckEndstops(Platform& platform) noexcept
 	}
 #endif
 }
-
-// The remaining functions are speed-critical, so use full optimisation
-// The GCC optimize pragma appears to be broken, if we try to force O3 optimisation here then functions are never inlined
 
 // Start executing this move. Must be called with interrupts disabled or basepri >= set interrupt priority, to avoid a race condition.
 void DDA::Start(Platform& p, uint32_t tim) noexcept

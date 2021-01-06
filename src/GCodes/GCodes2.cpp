@@ -35,15 +35,15 @@
 #endif
 
 #if HAS_WIFI_NETWORKING
-# include "FirmwareUpdater.h"
+# include <Comms/FirmwareUpdater.h>
 #endif
 
 #if SUPPORT_12864_LCD
 # include "Display/Display.h"
 #endif
 
-#if SUPPORT_DOTSTAR_LED
-# include "Fans/DotStarLed.h"
+#if SUPPORT_LED_STRIPS
+# include <Fans/LedStripDriver.h>
 #endif
 
 #if SUPPORT_CAN_EXPANSION
@@ -464,7 +464,8 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 			|| code == 112
 			|| code == 374 || code == 375
 			|| code == 470 || code == 471
-			|| code == 500 || code == 503 || code == 505 || code == 550
+			|| code == 500 || code == 503 || code == 505
+			|| code == 540 || code == 550 || code == 552 || code == 586 || (code >= 587 && code <= 589)
 			|| code == 703
 			|| code == 905 || code == 929 || code == 997 || code == 999
 		   )
@@ -749,25 +750,22 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 					FileInfo fileInfo;
 					if (MassStorage::FindFirst(dir.c_str(), fileInfo))
 					{
-						// iterate through all entries and append each file name
-						do {
+						// Iterate through all entries and append each file name
+						bool first = true;
+						do
+						{
 							if (encapsulateList)
 							{
-								outBuf->catf("%c%s%c%c", FILE_LIST_BRACKET, fileInfo.fileName.c_str(), FILE_LIST_BRACKET, FILE_LIST_SEPARATOR);
+								outBuf->catf((first) ? "\"%s\"" : ",\"%s\"", fileInfo.fileName.c_str());
+								first = false;
 							}
 							else
 							{
 								outBuf->catf("%s\n", fileInfo.fileName.c_str());
 							}
 						} while (MassStorage::FindNext(fileInfo));
-
-						if (encapsulateList)
-						{
-							// remove the last separator
-							(*outBuf)[outBuf->Length() - 1] = 0;
-						}
 					}
-					else
+					else if (!encapsulateList)
 					{
 						outBuf->cat("NONE\n");
 					}
@@ -1049,12 +1047,7 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 
 				String<MaxFilenameLength> filename;
 				gb.GetUnprecedentedString(filename.GetRef(), true);
-				const bool done = reprap.GetFileInfoResponse((filename.IsEmpty()) ? nullptr : filename.c_str(), outBuf, false);
-				if (outBuf != nullptr)
-				{
-					outBuf->cat('\n');
-				}
-				result = (done) ? GCodeResult::ok : GCodeResult::notFinished;
+				result = reprap.GetFileInfoResponse((filename.IsEmpty()) ? nullptr : filename.c_str(), outBuf, false);
 # endif
 			}
 			break;
@@ -1682,10 +1675,14 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 				gb.GetQuotedString(message.GetRef());
 
 				MessageType type = GenericMessage;
+#if HAS_MASS_STORAGE
 				bool seenP = false;
+#endif
 				if (gb.Seen('P'))
 				{
+#if HAS_MASS_STORAGE
 					seenP = true;
+#endif
 					const int32_t param = gb.GetIValue();
 					switch (param)
 					{
@@ -1746,15 +1743,9 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 
 				if (result != GCodeResult::error)
 				{
-					if ((type & HttpMessage) == 0)
-					{
-						platform.Message((MessageType)(type | PushFlag), message.c_str());
-						platform.Message(type, "\n");
-					}
-					else
-					{
-						platform.Message(type, message.c_str());
-					}
+					// Append newline and send the message to the destinations
+					message.cat('\n');
+					platform.Message(type, message.c_str());
 				}
 			}
 			break;
@@ -1914,9 +1905,9 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 			}
 			break;
 
-#if SUPPORT_DOTSTAR_LED
+#if SUPPORT_LED_STRIPS
 		case 150:
-			result = DotStarLed::SetColours(gb, reply);
+			result = LedStripDriver::SetColours(gb, reply);
 			break;
 #endif
 
@@ -2050,13 +2041,16 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 
 		case 203: // Set/print minimum/maximum feedrates
 			{
+				// Units are mm/sec if S1 is given, else mm/min
+				const bool usingMmPerSec = (gb.Seen('S') && gb.GetIValue() == 1);
+				const float settingMultiplier = (usingMmPerSec) ? 1.0 : SecondsToMinutes;
 				bool seen = false;
 
 				// Do the minimum first, because we constrain the maximum rates to be no lower than it
 				if (gb.Seen('I'))
 				{
 					seen = true;
-					platform.SetMinMovementSpeed(gb.GetDistance() * SecondsToMinutes);
+					platform.SetMinMovementSpeed(gb.GetDistance() * settingMultiplier);
 				}
 
 				for (size_t axis = 0; axis < numTotalAxes; ++axis)
@@ -2064,7 +2058,7 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 					if (gb.Seen(axisLetters[axis]))
 					{
 						seen = true;
-						platform.SetMaxFeedrate(axis, gb.GetDistance() * SecondsToMinutes);
+						platform.SetMaxFeedrate(axis, gb.GetDistance() * settingMultiplier);
 					}
 				}
 
@@ -2076,7 +2070,7 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 					gb.GetFloatArray(eVals, eCount, true);
 					for (size_t e = 0; e < eCount; e++)
 					{
-						platform.SetMaxFeedrate(ExtruderToLogicalDrive(e), gb.ConvertDistance(eVals[e]) * SecondsToMinutes);
+						platform.SetMaxFeedrate(ExtruderToLogicalDrive(e), gb.ConvertDistance(eVals[e]) * settingMultiplier);
 					}
 				}
 
@@ -2086,19 +2080,20 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 				}
 				else
 				{
-					reply.copy("Max speeds (mm/sec): ");
+					const float reportingMultiplier = (usingMmPerSec) ? 1.0 : MinutesToSeconds;
+					reply.printf("Max speeds (mm/%s): ", (usingMmPerSec) ? "sec" : "min");
 					for (size_t axis = 0; axis < numTotalAxes; ++axis)
 					{
-						reply.catf("%c: %.1f, ", axisLetters[axis], (double)platform.MaxFeedrate(axis));
+						reply.catf("%c: %.1f, ", axisLetters[axis], (double)(platform.MaxFeedrate(axis) * reportingMultiplier));
 					}
 					reply.cat("E:");
 					char sep = ' ';
 					for (size_t extruder = 0; extruder < numExtruders; extruder++)
 					{
-						reply.catf("%c%.1f", sep, (double)platform.MaxFeedrate(ExtruderToLogicalDrive(extruder)));
+						reply.catf("%c%.1f", sep, (double)(platform.MaxFeedrate(ExtruderToLogicalDrive(extruder)) * reportingMultiplier));
 						sep = ':';
 					}
-					reply.catf(", min. speed %.2f", (double)platform.MinMovementSpeed());
+					reply.catf(", min. speed %.2f", (double)(platform.MinMovementSpeed() * reportingMultiplier));
 				}
 			}
 			break;
@@ -3095,6 +3090,9 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 			break;
 
 		case 556: // Axis compensation (we support only X, Y, Z)
+		{
+			bool seen = false;
+
 			if (gb.Seen('S'))
 			{
 				const float value = gb.GetFValue();
@@ -3105,16 +3103,26 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 						if (gb.Seen(axisLetters[axis]))
 						{
 							reprap.GetMove().SetAxisCompensation(axis, gb.GetFValue() / value);
+							seen = true;
 						}
 					}
 				}
 			}
-			else
+
+			if (gb.Seen('P'))
 			{
-				reply.printf("Axis compensations - XY: %.5f, YZ: %.5f, ZX: %.5f",
+				reprap.GetMove().SetXYCompensation(gb.GetIValue() <= 0);
+				seen = true;
+			}
+
+			if (!seen)
+			{
+				reply.printf("Axis compensations - %s: %.5f, YZ: %.5f, ZX: %.5f",
+					reprap.GetMove().IsXYCompensated() ? "XY" : "YX",
 					(double)reprap.GetMove().AxisCompensation(X_AXIS), (double)reprap.GetMove().AxisCompensation(Y_AXIS), (double)reprap.GetMove().AxisCompensation(Z_AXIS));
 			}
 			break;
+		}
 
 		case 557: // Set/report Z probe point coordinates
 			result = DefineGrid(gb, reply);
@@ -3526,6 +3534,17 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 			{
 				const unsigned int interface = (gb.Seen('I') ? gb.GetUIValue() : 0);
 
+				bool seen = false;
+#if SUPPORT_HTTP
+				if (gb.Seen('C'))
+				{
+					String<StringLength20> corsSite;
+					gb.GetQuotedString(corsSite.GetRef(), true);
+					reprap.GetNetwork().SetCorsSite(corsSite.c_str());
+					seen = true;
+				}
+#endif
+
 				if (gb.Seen('P'))
 				{
 					const unsigned int protocol = gb.GetUIValue();
@@ -3542,10 +3561,23 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 						{
 							result = reprap.GetNetwork().DisableProtocol(interface, protocol, reply);
 						}
+						seen = true;
 					}
 				}
-				else
+
+
+				if (!seen)
 				{
+#if SUPPORT_HTTP
+					if (reprap.GetNetwork().GetCorsSite() != nullptr)
+					{
+						reply.printf("CORS enabled for site '%s'", reprap.GetNetwork().GetCorsSite());
+					}
+					else
+					{
+						reply.copy("CORS disabled");
+					}
+#endif
 					// Default to reporting current protocols if P or S parameter missing
 					result = reprap.GetNetwork().ReportProtocols(interface, reply);
 				}
@@ -3601,6 +3633,10 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 			result = reprap.GetMove().StartHeightFollowing(gb, reply);
 			break;
 #endif
+
+		case 595:	// Configure movement queue size
+			result = reprap.GetMove().ConfigureMovementQueue(gb, reply);
+			break;
 
 		// For cases 600 and 601, see 226
 
@@ -4394,6 +4430,31 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 				}
 			}
 #endif
+#if HAS_AUX_DEVICES
+			if (gb.Seen('A'))
+			{
+				const uint32_t serialChannel = gb.GetLimitedUIValue('A', NumSerialChannels, 1);
+				const uint32_t auxChannel = serialChannel - 1;
+				if (platform.IsAuxEnabled(auxChannel))
+				{
+					if (gb.Seen('P'))
+					{
+						String<StringLength20> eraseString;
+						gb.GetQuotedString(eraseString.GetRef());
+						if (eraseString.Equals("ERASE"))
+						{
+							platform.AppendAuxReply(auxChannel, panelDueCommandEraseAndReset, true);
+						}
+					}
+					else
+					{
+						platform.AppendAuxReply(auxChannel, panelDueCommandReset, true);
+					}
+					break;
+				}
+			}
+#endif
+
 			if (!gb.DoDwellTime(1000))		// wait a second to allow the response to be sent back to the web server, otherwise it may retry
 			{
 				return false;

@@ -249,7 +249,7 @@ void debugPrintf(const char* fmt, ...) noexcept
 	{
 		va_list vargs;
 		va_start(vargs, fmt);
-		reprap.GetPlatform().MessageF(DebugMessage, fmt, vargs);
+		reprap.GetPlatform().DebugMessage(fmt, vargs);
 		va_end(vargs);
 	}
 }
@@ -259,30 +259,6 @@ void debugPrintf(const char* fmt, ...) noexcept
 void delay(uint32_t ms) noexcept
 {
 	vTaskDelay(ms);
-}
-
-// Optimised version of memcpy for when we know that the source and destination are 32-bit aligned and a whole number of 32-bit words are to be copied
-void __attribute__ ((__optimize__ ("-fno-tree-loop-distribute-patterns"))) memcpyu32(uint32_t *dst, const uint32_t *src, size_t numWords) noexcept
-{
-	while (numWords >= 4)
-	{
-		*dst++ = *src++;
-		*dst++ = *src++;
-		*dst++ = *src++;
-		*dst++ = *src++;
-		numWords -= 4;
-	}
-
-	if ((numWords & 2) != 0)
-	{
-		*dst++ = *src++;
-		*dst++ = *src++;
-	}
-
-	if ((numWords & 1) != 0)
-	{
-		*dst++ = *src++;
-	}
 }
 
 #endif

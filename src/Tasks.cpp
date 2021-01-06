@@ -11,9 +11,10 @@
 #include <Cache.h>
 #include <TaskPriorities.h>
 #include <Hardware/SoftwareReset.h>
+#include <Storage/CRC32.h>
 
 #if SAM4E || SAM4S || SAME70
-# include "sam/services/flash_efc/flash_efc.h"		// for efc_enable_cloe()
+# include <efc/efc.h>		// for efc_enable_cloe()
 #endif
 
 #if SAME5x
@@ -25,7 +26,7 @@
 #include "task.h"
 #include <malloc.h>
 
-const uint8_t memPattern = 0xA5;
+const uint8_t memPattern = 0xA5;		// this must be the same pattern as FreeRTOS because we use common code for checking for stack overflow
 
 extern char _end;						// defined in linker script
 extern char _estack;					// defined in linker script
@@ -80,7 +81,6 @@ extern "C" void vApplicationGetTimerTaskMemory(StaticTask_t **ppxTimerTaskTCBBuf
 
 // Mutexes
 static Mutex i2cMutex;
-static Mutex sysDirMutex;
 static Mutex mallocMutex;
 static Mutex filamentsMutex;
 
@@ -199,7 +199,6 @@ extern "C" [[noreturn]] void AppMain() noexcept
 	// Create the mutexes and the startup task
 	mallocMutex.Create("Malloc");
 	i2cMutex.Create("I2C");
-	sysDirMutex.Create("SysDir");
 	filamentsMutex.Create("Filaments");
 	mainTask.Create(MainTask, "MAIN", nullptr, TaskPriority::SpinPriority);
 
@@ -224,12 +223,12 @@ extern "C" [[noreturn]] void MainTask(void *pvParameters) noexcept
 static ptrdiff_t GetHandlerFreeStack() noexcept
 {
 	const char * const ramend = &_estack;
-	const char * stack_lwm = heapTop;
+	const char * stack_lwm = sysStackLimit;
 	while (stack_lwm < ramend && *stack_lwm == memPattern)
 	{
 		++stack_lwm;
 	}
-	return stack_lwm - heapLimit;
+	return stack_lwm - sysStackLimit;
 }
 
 ptrdiff_t Tasks::GetNeverUsedRam() noexcept
@@ -242,6 +241,21 @@ const char* Tasks::GetHeapTop() noexcept
 	return heapTop;
 }
 
+// Allocate memory permanently. Using this saves about 8 bytes per object. You must not call free() on the returned object.
+// It doesn't try to allocate from the free list maintained by malloc, only from virgin memory.
+void *Tasks::AllocPermanent(size_t sz, std::align_val_t align) noexcept
+{
+	GetMallocMutex();
+	char *newHeapLimit = reinterpret_cast<char *>(reinterpret_cast<uint32_t>(heapLimit - sz) & ~((uint32_t)align - 1));
+	if (newHeapLimit < heapTop)
+	{
+		OutOfMemoryHandler();
+	}
+	heapLimit = newHeapLimit;
+	ReleaseMallocMutex();
+	return newHeapLimit;
+}
+
 // Write data about the current task
 void Tasks::Diagnostics(MessageType mtype) noexcept
 {
@@ -250,16 +264,12 @@ void Tasks::Diagnostics(MessageType mtype) noexcept
 	// Print memory stats
 	{
 		const char * const ramstart =
-#if SAME70
-			(char *) 0x20400000;
-#elif SAM4E || SAM4S || SAME5x
-			(char *) 0x20000000;
-#elif SAM3XA
-			(char *) 0x20070000;
+#if SAME5x
+			(char *) HSRAM_ADDR;
 #elif defined(__LPC17xx__)
 			(char *) 0x10000000;
 #else
-# error Unsupported processor
+			(char *) IRAM_ADDR;
 #endif
 		p.MessageF(mtype, "Static ram: %d\n", &_end - ramstart);
 
@@ -308,17 +318,12 @@ void Tasks::TerminateMainTask() noexcept
 	mainTask.TerminateAndUnlink();
 }
 
-const Mutex *Tasks::GetI2CMutex() noexcept
+Mutex *Tasks::GetI2CMutex() noexcept
 {
 	return &i2cMutex;
 }
 
-const Mutex *Tasks::GetSysDirMutex() noexcept
-{
-	return &sysDirMutex;
-}
-
-const Mutex *Tasks::GetFilamentsMutex() noexcept
+Mutex *Tasks::GetFilamentsMutex() noexcept
 {
 	return &filamentsMutex;
 }

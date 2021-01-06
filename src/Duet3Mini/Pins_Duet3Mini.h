@@ -28,11 +28,11 @@
 # endif
 #endif
 
-constexpr size_t NumFirmwareUpdateModules = 2;		// main module and WiFi module
+constexpr size_t NumFirmwareUpdateModules = 5;		// 0 = mainboard, 1 = wifi, 4 = PanelDue, other values unused
 
 #define IAP_FIRMWARE_FILE		"Duet3Firmware_" BOARD_SHORT_NAME ".uf2"
-#define IAP_UPDATE_FILE			"Duet3_SDiap_" BOARD_SHORT_NAME ".bin"
-#define IAP_UPDATE_FILE_SBC		"Duet3_SBCiap_" BOARD_SHORT_NAME ".bin"
+#define IAP_UPDATE_FILE			"Duet3_SDiap32_" BOARD_SHORT_NAME ".bin"
+#define IAP_UPDATE_FILE_SBC		"Duet3_SBCiap32_" BOARD_SHORT_NAME ".bin"
 constexpr uint32_t IAP_IMAGE_START = 0x20038000;
 
 #define WIFI_FIRMWARE_FILE		"DuetWiFiServer.bin"
@@ -61,7 +61,7 @@ constexpr uint32_t IAP_IMAGE_START = 0x20038000;
 #define SUPPORT_CAN_EXPANSION	0
 #endif
 
-#define SUPPORT_DOTSTAR_LED		1
+#define SUPPORT_LED_STRIPS		1
 #define SUPPORT_INKJET			0					// set nonzero to support inkjet control
 #define SUPPORT_ROLAND			0					// set nonzero to support Roland mill
 #define SUPPORT_SCANNER			1					// set zero to disable support for FreeLSS scanners
@@ -193,6 +193,7 @@ constexpr Pin TMC22xxMuxPins[1] = { PortDPin(0) };
 #define TMC22xx_VARIABLE_NUM_DRIVERS	0
 #define TMC22xx_SINGLE_DRIVER			0
 #define TMC22xx_USE_SLAVEADDR			1
+#define TMC22xx_DEFAULT_STEALTHCHOP		1
 
 // Define the baud rate used to send/receive data to/from the drivers.
 // If we assume a worst case clock frequency of 8MHz then the maximum baud rate is 8MHz/16 = 500kbaud.
@@ -306,7 +307,7 @@ constexpr Pin LcdNeopixelOutPin = PortBPin(14);			// shared with io4.out
 // Neopixel output
 constexpr Pin NeopixelOutPin = PortAPin(8);
 constexpr GpioPinFunction NeopixelOutPinFunction = GpioPinFunction::H;		// QSPI Data[0]
-#define DOTSTAR_USES_USART		(0)
+#define LEDSTRIP_USES_USART		(0)
 
 // Shared SPI definitions
 constexpr uint8_t SharedSpiSercomNumber = 7;

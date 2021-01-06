@@ -8,7 +8,8 @@
 #ifndef DRIVEMOVEMENT_H_
 #define DRIVEMOVEMENT_H_
 
-#include "RepRapFirmware.h"
+#include <RepRapFirmware.h>
+#include <Tasks.h>
 
 class LinearDeltaKinematics;
 
@@ -134,11 +135,14 @@ public:
 
 	DriveMovement(DriveMovement *next) noexcept;
 
-	bool CalcNextStepTimeCartesian(const DDA &dda, bool live) noexcept __attribute__ ((hot));
-	bool CalcNextStepTimeDelta(const DDA &dda, bool live) noexcept __attribute__ ((hot));
-	bool PrepareCartesianAxis(const DDA& dda, const PrepParams& params) noexcept __attribute__ ((hot));
-	bool PrepareDeltaAxis(const DDA& dda, const PrepParams& params) noexcept __attribute__ ((hot));
-	bool PrepareExtruder(const DDA& dda, const PrepParams& params, float& extrusionPending, float speedChange, bool doCompensation) noexcept __attribute__ ((hot));
+	void* operator new(size_t count) { return Tasks::AllocPermanent(count); }
+	void* operator new(size_t count, std::align_val_t align) { return Tasks::AllocPermanent(count, align); }
+
+	bool CalcNextStepTimeCartesian(const DDA &dda, bool live) noexcept SPEED_CRITICAL;
+	bool CalcNextStepTimeDelta(const DDA &dda, bool live) noexcept SPEED_CRITICAL;
+	bool PrepareCartesianAxis(const DDA& dda, const PrepParams& params) noexcept SPEED_CRITICAL;
+	bool PrepareDeltaAxis(const DDA& dda, const PrepParams& params) noexcept SPEED_CRITICAL;
+	bool PrepareExtruder(const DDA& dda, const PrepParams& params, float& extrusionPending, float speedChange, bool doCompensation) noexcept SPEED_CRITICAL;
 	void ReduceSpeed(uint32_t inverseSpeedFactor) noexcept;
 	void DebugPrint() const noexcept;
 	int32_t GetNetStepsLeft() const noexcept;
@@ -153,19 +157,16 @@ public:
 #endif
 
 	static void InitialAllocate(unsigned int num) noexcept;
-	static int NumFree() noexcept { return numFree; }
-	static int MinFree() noexcept { return minFree; }
-	static void ResetMinFree() noexcept { minFree = numFree; }
+	static unsigned int NumCreated() noexcept { return numCreated; }
 	static DriveMovement *Allocate(size_t p_drive, DMState st) noexcept;
 	static void Release(DriveMovement *item) noexcept;
 
 private:
-	bool CalcNextStepTimeCartesianFull(const DDA &dda, bool live) noexcept __attribute__ ((hot));
-	bool CalcNextStepTimeDeltaFull(const DDA &dda, bool live) noexcept __attribute__ ((hot));
+	bool CalcNextStepTimeCartesianFull(const DDA &dda, bool live) noexcept SPEED_CRITICAL;
+	bool CalcNextStepTimeDeltaFull(const DDA &dda, bool live) noexcept SPEED_CRITICAL;
 
 	static DriveMovement *freeList;
-	static int numFree;
-	static int minFree;
+	static unsigned int numCreated;
 
 	// Parameters common to Cartesian, delta and extruder moves
 
@@ -321,7 +322,6 @@ inline void DriveMovement::Release(DriveMovement *item) noexcept
 {
 	item->nextDM = freeList;
 	freeList = item;
-	++numFree;
 }
 
 #if HAS_SMART_DRIVERS

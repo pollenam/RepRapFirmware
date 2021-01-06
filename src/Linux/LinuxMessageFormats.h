@@ -19,7 +19,7 @@ constexpr uint8_t LinuxFormatCode = 0x5F;			// standard format code for RRF SPI 
 constexpr uint8_t LiunxFormatCodeStandalone = 0x60;	// used to indicate that RRF is running in stand-alone mode
 constexpr uint8_t InvalidFormatCode = 0xC9;			// must be different from any other format code
 
-constexpr uint16_t LinuxProtocolVersion = 3;
+constexpr uint16_t LinuxProtocolVersion = 4;
 
 constexpr size_t LinuxTransferBufferSize = 8192;	// maximum length of a data transfer. Must be a multiple of 4 and kept in sync with Duet Control Server!
 static_assert(LinuxTransferBufferSize % sizeof(uint32_t) == 0, "LinuxTransferBufferSize must be a whole number of dwords");
@@ -28,8 +28,9 @@ constexpr size_t MaxCodeBufferSize = 256;			// maximum length of a G/M/T-code in
 static_assert(MaxCodeBufferSize % sizeof(uint32_t) == 0, "MaxCodeBufferSize must be a whole number of dwords");
 static_assert(MaxCodeBufferSize >= GCODE_LENGTH, "MaxCodeBufferSize must be at least as big as GCODE_LENGTH");
 
+constexpr uint32_t SpiMacroRequestTimeout = 3000;	// maximum time to wait a macro file
 constexpr uint32_t SpiTransferTimeout = 500;		// maximum allowed delay between data exchanges during a full transfer (in ms)
-constexpr uint32_t SpiConnectionTimeout = 8000;		// maximum time to wait for the next transfer (in ms)
+constexpr uint32_t SpiConnectionTimeout = 4000;		// maximum time to wait for the next transfer (in ms)
 constexpr uint16_t SpiCodeBufferSize = 4096;		// number of bytes available for G-code caching
 
 // Shared structures
@@ -97,8 +98,8 @@ struct TransferHeader
 	uint16_t protocolVersion;
 	uint16_t sequenceNumber;
 	uint16_t dataLength;
-	uint16_t checksumData;
-	uint16_t checksumHeader;
+	uint32_t crcData;
+	uint32_t crcHeader;
 };
 
 enum TransferResponse : uint32_t
@@ -223,8 +224,10 @@ enum class LinuxRequest : uint16_t
 	FileChunk = 15,								// Response to a file chunk request from a CAN-connected board
 	EvaluateExpression = 16,					// Evaluate an arbitrary expression
 	Message = 17,								// Send an arbitrary message
+	MacroStarted = 18,							// Macro file has been started
+	FilesAborted = 19,							// All files on the given channel have been aborted by DSF
 
-	InvalidRequest = 18
+	InvalidRequest = 20
 };
 
 struct AssignFilamentHeader
